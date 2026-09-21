@@ -1,19 +1,23 @@
 /**
  * Nexus — Core Client Logic
- * WebRTC Signaling, P2P Video/Audio, DataChannels (Chat & Files), Screen Sharing
+ * WebRTC Multi-Participant Mesh Signaling, Media Management, DataChannels, Device & Quality Controls
  */
 
 // ===== Global State =====
 let socket = null;
 let roomCode = null;
 let isHost = false;
+let myDisplayName = 'User';
+let maxRoomMembers = 2;
 
 let localStream = null;
 let remoteStream = null;
 let screenStream = null;
 let isScreenSharing = false;
 
-let pc = null;
+// Multi-Peer State (Mesh Architecture)
+const peers = {}; // { [socketId]: { socketId, displayName, pc, chatChannel, fileChannel, stream, quality, stats } }
+let pc = null; // Legacy single-peer fallback reference
 let chatChannel = null;
 let fileChannel = null;
 
@@ -23,6 +27,16 @@ let unreadChatCount = 0;
 let reconnectAttempts = 0;
 let isRestartingIce = false;
 const MAX_RECONNECT_ATTEMPTS = 3;
+
+// Device & Quality Selection State
+let selectedVideoDeviceId = null;
+let selectedAudioDeviceId = null;
+let selectedAudioOutputDeviceId = null;
+let selectedVideoQuality = 'auto';
+let isPushToTalk = false;
+let isSpacePressed = false;
+let statsIntervalId = null;
+let focusedSocketId = null;
 
 // Theme Shader Colors
 const THEME_COLORS = {
@@ -41,7 +55,7 @@ const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB max file size
 const MAX_SIMULTANEOUS_TRANSFERS = 3;
 const CHUNK_SIZE = 16384; // 16 KB
 
-// Dynamic WebRTC Configuration (Loaded from server endpoint)
+// Dynamic WebRTC Configuration
 let rtcConfig = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -69,6 +83,9 @@ window.addEventListener('load', async () => {
   initSilk();
   await fetchIceServers();
 
+  const storedName = sessionStorage.getItem('nexus_name');
+  if (storedName) myDisplayName = storedName;
+
   const parts = location.pathname.split('/').filter(Boolean);
   if (parts[0] === 'room' && parts[1]) {
     roomCode = parts[1].toUpperCase();
@@ -77,6 +94,7 @@ window.addEventListener('load', async () => {
   }
 
   setupEventListeners();
+  setupNetworkListeners();
 });
 
 // ===== Theme & Silk Background Initialization =====
@@ -112,7 +130,7 @@ function changeTheme(themeName) {
   }
 }
 
-// ===== UI & Keyboard Event Listeners =====
+// ===== UI, Keyboard & Network Event Listeners =====
 function setupEventListeners() {
   const dropZone = document.getElementById('dropZone');
   if (dropZone) {
@@ -180,11 +198,59 @@ function setupEventListeners() {
   const btnScreen = document.getElementById('btnScreen');
   if (btnScreen) btnScreen.onclick = toggleScreenShare;
 
+  // Global Keyboard Shortcuts
   document.addEventListener('keydown', (e) => {
-    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) return;
-    const key = e.key.toLowerCase();
-    if (key === 'm') toggleAudio();
-    if (key === 'v') toggleVideo();
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
+
+    if (e.code === 'Space' && isPushToTalk && !isSpacePressed) {
+      isSpacePressed = true;
+      const audioTrack = localStream?.getAudioTracks()?.[0];
+      if (audioTrack) audioTrack.enabled = true;
+      const btn = document.getElementById('btnAudio');
+      if (btn) btn.classList.remove('off');
+      e.preventDefault();
+    } else if (!e.repeat) {
+      const key = e.key.toLowerCase();
+      if (key === 'm') toggleAudio();
+      if (key === 'v') toggleVideo();
+      if (key === 's') toggleScreenShare();
+      if (key === 'f') fullscreenPage();
+      if (key === 'c') toggleDrawer('chat');
+      if (key === 'escape') {
+        closeSettings();
+        closeQrModal();
+        closeCreateModal();
+        const chatDrawer = document.getElementById('chatDrawer');
+        if (chatDrawer && chatDrawer.classList.contains('open')) toggleDrawer('chat');
+        const fileDrawer = document.getElementById('fileDrawer');
+        if (fileDrawer && fileDrawer.classList.contains('open')) toggleDrawer('file');
+      }
+    }
+  });
+
+  document.addEventListener('keyup', (e) => {
+    if (e.code === 'Space' && isPushToTalk && isSpacePressed) {
+      isSpacePressed = false;
+      const audioTrack = localStream?.getAudioTracks()?.[0];
+      if (audioTrack) audioTrack.enabled = false;
+      const btn = document.getElementById('btnAudio');
+      if (btn) btn.classList.add('off');
+    }
+  });
+}
+
+function setupNetworkListeners() {
+  window.addEventListener('online', () => {
+    toast('Network reconnected — restarting ICE...');
+    updateConnectionStatus('connecting', 'Reconnecting...');
+    for (const id in peers) {
+      if (peers[id] && peers[id].pc) attemptIceRestart(peers[id].pc);
+    }
+  });
+
+  window.addEventListener('offline', () => {
+    toast('Network connection lost');
+    updateConnectionStatus('disconnected', 'Network offline');
   });
 }
 
@@ -202,7 +268,7 @@ function updateConnectionStatus(state, text) {
   if (txt) txt.textContent = text;
 }
 
-// ===== Camera & Microphone Media Acquisition & Permission Handling =====
+// ===== Camera & Microphone Media Acquisition =====
 async function requestMediaPermissionsAndJoin() {
   const btnAllow = document.getElementById('btnAllowJoin');
   const btnTryAgain = document.getElementById('btnTryAgainPermission');
@@ -239,7 +305,6 @@ async function requestMediaPermissionsAndJoin() {
   let cameraError = null;
   let micError = null;
 
-  // 1. Request Camera Independently
   try {
     const camStream = await navigator.mediaDevices.getUserMedia({ video: true });
     if (camStream && camStream.getVideoTracks().length > 0) {
@@ -249,7 +314,6 @@ async function requestMediaPermissionsAndJoin() {
     cameraError = getFriendlyMediaError('Camera', err);
   }
 
-  // 2. Request Microphone Independently
   try {
     const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     if (micStream && micStream.getAudioTracks().length > 0) {
@@ -259,7 +323,6 @@ async function requestMediaPermissionsAndJoin() {
     micError = getFriendlyMediaError('Microphone', err);
   }
 
-  // 3. Update UI Status Display
   if (camStatus) {
     if (cameraTrack) {
       camStatus.textContent = '✓ Ready';
@@ -284,7 +347,6 @@ async function requestMediaPermissionsAndJoin() {
   if (cameraTrack) tracks.push(cameraTrack);
   if (audioTrack) tracks.push(audioTrack);
 
-  // If neither camera nor microphone was acquired
   if (tracks.length === 0) {
     if (btnAllow) btnAllow.style.display = 'none';
     if (btnTryAgain) btnTryAgain.style.display = 'inline-block';
@@ -304,7 +366,6 @@ async function requestMediaPermissionsAndJoin() {
     return;
   }
 
-  // Assign Local MediaStream
   localStream = new MediaStream(tracks);
 
   const localVideo = document.getElementById('localVideo');
@@ -316,16 +377,13 @@ async function requestMediaPermissionsAndJoin() {
     localVideo.muted = true;
     localVideo.playsInline = true;
 
-    try {
-      await localVideo.play();
-    } catch (e) {}
+    try { await localVideo.play(); } catch (e) {}
   }
 
   if (localAvatar && cameraTrack) {
     localAvatar.style.display = 'none';
   }
 
-  // Hide Pre-Call Modal
   const preCallModal = document.getElementById('preCallModal');
   if (preCallModal) preCallModal.classList.remove('open');
 
@@ -334,7 +392,6 @@ async function requestMediaPermissionsAndJoin() {
     btnAllow.textContent = 'Allow & Join Room';
   }
 
-  // Connect Socket.IO signaling & proceed to WebRTC peer connection
   await connectSocketAndJoinRoom();
 }
 
@@ -344,46 +401,26 @@ function getFriendlyMediaError(deviceType, err) {
   switch (err.name) {
     case 'NotAllowedError':
     case 'PermissionDeniedError':
-      return {
-        short: 'Permission Denied',
-        long: `Permission denied for ${deviceType.toLowerCase()}. Please check browser site permissions.`
-      };
+      return { short: 'Permission Denied', long: `Permission denied for ${deviceType.toLowerCase()}.` };
     case 'NotFoundError':
     case 'DevicesNotFoundError':
-      return {
-        short: 'Not Found',
-        long: `No ${deviceType.toLowerCase()} device detected on this system.`
-      };
+      return { short: 'Not Found', long: `No ${deviceType.toLowerCase()} device detected on this system.` };
     case 'NotReadableError':
     case 'TrackStartError':
-      return {
-        short: 'In Use',
-        long: `${deviceType} is currently in use by another application.`
-      };
-    case 'OverconstrainedError':
-    case 'ConstraintNotSatisfiedError':
-      return {
-        short: 'Hardware Constraint',
-        long: `${deviceType} requirements could not be met by your hardware.`
-      };
-    case 'SecurityError':
-      return {
-        short: 'Security Restricted',
-        long: `${deviceType} access is blocked by browser security policy.`
-      };
+      return { short: 'In Use', long: `${deviceType} is currently in use by another application.` };
     default:
-      return {
-        short: 'Access Error',
-        long: `Unable to access ${deviceType.toLowerCase()}: ${err.message || 'unknown error'}`
-      };
+      return { short: 'Access Error', long: `Unable to access ${deviceType.toLowerCase()}: ${err.message || 'unknown error'}` };
   }
 }
 
 // ===== Socket.IO Connection & Room Signaling Flow =====
 function joinExistingRoom(pin) {
   const finalPin = pin || sessionStorage.getItem('nexus_pin_' + roomCode) || sessionStorage.getItem('linkdrop_pin_' + roomCode) || null;
+  const storedMax = sessionStorage.getItem('nexus_max_' + roomCode) || '2';
+  const storedName = sessionStorage.getItem('nexus_name') || 'User';
+
   if (socket) {
-    socket.emit('join-room', roomCode, socket.id, finalPin);
+    socket.emit('join-room', roomCode, socket.id, finalPin, storedMax, storedName);
   }
 }
 
@@ -408,22 +445,22 @@ async function connectSocketAndJoinRoom() {
   socket.on('connect', () => {
     updateConnectionStatus('connecting', 'Signaling Connected...');
 
-    // Ask server whether room requires PIN BEFORE joining
     socket.emit('check-room', { roomId: roomCode }, (result) => {
+      if (result && result.maxMembers) {
+        maxRoomMembers = result.maxMembers;
+      }
+
       if (!result || !result.exists) {
-        // Room does not exist on server yet -> Host creating room
         const savedPin = sessionStorage.getItem('nexus_pin_' + roomCode) || sessionStorage.getItem('linkdrop_pin_' + roomCode) || null;
         joinExistingRoom(savedPin);
         return;
       }
 
       if (result.protected) {
-        // Check if user is host of this room
         const isHostSession = sessionStorage.getItem('nexus_host_' + roomCode) === 'true' || sessionStorage.getItem('linkdrop_host_' + roomCode) === 'true';
         const savedPin = sessionStorage.getItem('nexus_pin_' + roomCode) || sessionStorage.getItem('linkdrop_pin_' + roomCode);
 
         if (isHostSession && savedPin) {
-          // Host re-entering their protected room -> verify PIN
           socket.emit('verify-room-pin', { roomId: roomCode, pin: savedPin }, (res) => {
             if (res && res.success) {
               joinExistingRoom(savedPin);
@@ -432,14 +469,20 @@ async function connectSocketAndJoinRoom() {
             }
           });
         } else {
-          // Guest attempting to join protected room -> Show PIN modal!
           showPinModal();
         }
       } else {
-        // Unprotected room -> Join directly!
         joinExistingRoom();
       }
     });
+  });
+
+  socket.on('room-joined', (data) => {
+    if (data) {
+      isHost = !!data.isHost;
+      maxRoomMembers = data.maxMembers || 2;
+      updateRoomSummaryInfo(data);
+    }
   });
 
   socket.on('pin-required', () => {
@@ -474,10 +517,15 @@ async function connectSocketAndJoinRoom() {
     setTimeout(() => location.href = '/', 2000);
   });
 
-  socket.on('request-join', () => {
+  socket.on('request-join', (data) => {
     isHost = true;
     const approvalPopup = document.getElementById('approvalPopup');
-    if (approvalPopup) approvalPopup.classList.add('open');
+    if (approvalPopup) {
+      const msgText = approvalPopup.querySelector('p');
+      if (msgText) msgText.textContent = `${data?.displayName || 'A participant'} wants to join your Nexus room.`;
+      approvalPopup.dataset.targetId = data?.socketId || '';
+      approvalPopup.classList.add('open');
+    }
   });
 
   socket.on('guest-canceled', () => {
@@ -486,9 +534,17 @@ async function connectSocketAndJoinRoom() {
     if (approvalPopup) approvalPopup.classList.remove('open');
   });
 
-  socket.on('accepted', async () => {
-    toast('Host accepted join request');
+  socket.on('accepted', async (data) => {
+    toast('Host accepted join request!');
     updateConnectionStatus('connecting', 'Establishing P2P...');
+    if (data && data.members) {
+      data.members.forEach(m => {
+        if (m.socketId !== socket.id) {
+          getOrCreatePeer(m.socketId, m.displayName, false);
+        }
+      });
+    }
+    startStatsMonitoring();
   });
 
   socket.on('rejected', () => {
@@ -497,60 +553,85 @@ async function connectSocketAndJoinRoom() {
     setTimeout(() => location.href = '/', 1500);
   });
 
-  socket.on('peer-disconnected', () => {
-    toast('Peer disconnected');
-    updateConnectionStatus('disconnected', 'Peer disconnected');
-
-    const remoteVideo = document.getElementById('remoteVideo');
-    if (remoteVideo) remoteVideo.srcObject = null;
-    const remoteAvatar = document.getElementById('remoteAvatar');
-    if (remoteAvatar) remoteAvatar.style.display = 'flex';
+  socket.on('user-joined', (data) => {
+    toast(`${data.displayName || 'New participant'} joined the room`);
+    if (data && data.socketId && data.socketId !== socket.id) {
+      getOrCreatePeer(data.socketId, data.displayName, true);
+    }
   });
 
-  // Signaling Offers / Answers / ICE Candidates
-  socket.on('offer', async (desc) => {
-    if (!pc) pc = createPeer();
-
-    if (localStream) {
-      localStream.getTracks().forEach(t => {
-        const senders = pc.getSenders();
-        if (!senders.some(s => s.track && s.track.id === t.id)) {
-          pc.addTrack(t, localStream);
-        }
-      });
+  socket.on('user-left', (data) => {
+    const peerId = data?.socketId || data;
+    if (peerId && peers[peerId]) {
+      toast(`${peers[peerId].displayName || 'Participant'} left`);
+      removePeer(peerId);
     }
+  });
+
+  socket.on('host-changed', (data) => {
+    if (data && data.newHostId === socket.id) {
+      isHost = true;
+      toast('You are now the Host of this room');
+    } else if (data) {
+      toast(`New Host: ${data.newHostName || 'Peer'}`);
+    }
+  });
+
+  // Targeted & Fallback WebRTC Signaling
+  socket.on('offer', async (data, legacySenderId) => {
+    const offer = data.offer || data;
+    const senderId = data.senderId || legacySenderId;
+    const senderName = data.senderName || 'Peer';
+
+    if (!senderId) return;
+
+    const peerObj = getOrCreatePeer(senderId, senderName, false);
+    const peerConnection = peerObj.pc;
 
     try {
-      await pc.setRemoteDescription(new RTCSessionDescription(desc));
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
       await flushQueuedCandidates();
 
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
 
-      socket.emit('answer', roomCode, answer);
+      socket.emit('answer', roomCode, answer, senderId);
     } catch (err) {
       console.error('[Nexus] Error handling offer:', err);
     }
   });
 
-  socket.on('answer', async (desc) => {
-    if (pc) {
+  socket.on('answer', async (data, legacySenderId) => {
+    const answer = data.answer || data;
+    const senderId = data.senderId || legacySenderId;
+
+    if (senderId && peers[senderId]) {
       try {
-        await pc.setRemoteDescription(new RTCSessionDescription(desc));
+        await peers[senderId].pc.setRemoteDescription(new RTCSessionDescription(answer));
         await flushQueuedCandidates();
       } catch (err) {
         console.error('[Nexus] Error setting remote answer:', err);
       }
+    } else if (pc) {
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        await flushQueuedCandidates();
+      } catch (err) {}
     }
   });
 
-  socket.on('ice-candidate', async (candidate) => {
-    if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+  socket.on('ice-candidate', async (data, legacySenderId) => {
+    const candidate = data.candidate || data;
+    const senderId = data.senderId || legacySenderId;
+
+    const targetPc = (senderId && peers[senderId]) ? peers[senderId].pc : pc;
+
+    if (targetPc && targetPc.remoteDescription && targetPc.remoteDescription.type) {
       try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        await targetPc.addIceCandidate(new RTCIceCandidate(candidate));
       } catch (err) {}
     } else {
-      queuedCandidates.push(candidate);
+      queuedCandidates.push({ candidate, senderId });
     }
   });
 
@@ -569,31 +650,209 @@ async function connectSocketAndJoinRoom() {
   const approvalPopup = document.getElementById('approvalPopup');
 
   if (acceptBtn) acceptBtn.onclick = () => {
-    socket.emit('accept', roomCode);
+    const targetId = approvalPopup?.dataset?.targetId;
+    socket.emit('accept', roomCode, targetId);
     if (approvalPopup) approvalPopup.classList.remove('open');
-    createAndSendOffer();
+    if (targetId) {
+      getOrCreatePeer(targetId, 'Guest', true);
+    } else {
+      createAndSendOffer();
+    }
   };
   if (rejectBtn) rejectBtn.onclick = () => {
-    socket.emit('reject', roomCode);
+    const targetId = approvalPopup?.dataset?.targetId;
+    socket.emit('reject', roomCode, targetId);
     if (approvalPopup) approvalPopup.classList.remove('open');
   };
+}
+
+// ===== Peer Connection Factory (Mesh Architecture) =====
+function getOrCreatePeer(targetSocketId, targetDisplayName, isInitiator = false) {
+  if (peers[targetSocketId]) return peers[targetSocketId];
+
+  const peerConnection = new RTCPeerConnection(rtcConfig);
+  pc = peerConnection; // Fallback reference
+
+  const peerObj = {
+    socketId: targetSocketId,
+    displayName: targetDisplayName || 'Peer',
+    pc: peerConnection,
+    chatChannel: null,
+    fileChannel: null,
+    stream: null,
+    quality: 'good'
+  };
+
+  peers[targetSocketId] = peerObj;
+
+  if (localStream) {
+    localStream.getTracks().forEach(track => {
+      peerConnection.addTrack(track, localStream);
+    });
+  }
+
+  peerConnection.onicecandidate = (e) => {
+    if (e.candidate && socket) {
+      socket.emit('ice-candidate', roomCode, e.candidate, targetSocketId);
+    }
+  };
+
+  peerConnection.ontrack = (e) => {
+    let remoteMediaStream = peerObj.stream;
+    if (!remoteMediaStream) {
+      remoteMediaStream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream();
+      peerObj.stream = remoteMediaStream;
+      remoteStream = remoteMediaStream; // Fallback
+    }
+    if (!remoteMediaStream.getTracks().some(t => t.id === e.track.id)) {
+      remoteMediaStream.addTrack(e.track);
+    }
+
+    renderParticipantVideoTile(targetSocketId, peerObj.displayName, remoteMediaStream);
+  };
+
+  peerConnection.onconnectionstatechange = () => {
+    const state = peerConnection.connectionState;
+    console.log(`[Nexus] WebRTC connectionState with ${targetSocketId}:`, state);
+    if (state === 'connected') {
+      updateConnectionStatus('connected', 'Connected');
+    } else if (state === 'disconnected' || state === 'failed') {
+      attemptIceRestart(peerConnection);
+    }
+  };
+
+  if (isInitiator) {
+    const chatCh = peerConnection.createDataChannel('chat');
+    setupChatChannelListeners(chatCh);
+    peerObj.chatChannel = chatCh;
+    chatChannel = chatCh;
+
+    const fileCh = peerConnection.createDataChannel('file-transfer');
+    setupFileChannelListeners(fileCh);
+    peerObj.fileChannel = fileCh;
+    fileChannel = fileCh;
+
+    peerConnection.createOffer()
+      .then(offer => peerConnection.setLocalDescription(offer))
+      .then(() => {
+        socket.emit('offer', roomCode, peerConnection.localDescription, targetSocketId);
+      })
+      .catch(err => console.error('[Nexus] Create offer error:', err));
+  } else {
+    peerConnection.ondatachannel = (e) => {
+      const channel = e.channel;
+      if (channel.label === 'chat') {
+        peerObj.chatChannel = channel;
+        chatChannel = channel;
+        setupChatChannelListeners(channel);
+      } else if (channel.label === 'file-transfer') {
+        peerObj.fileChannel = channel;
+        fileChannel = channel;
+        setupFileChannelListeners(channel);
+      }
+    };
+  }
+
+  return peerObj;
+}
+
+function removePeer(targetSocketId) {
+  if (peers[targetSocketId]) {
+    try { peers[targetSocketId].pc.close(); } catch(e) {}
+    delete peers[targetSocketId];
+  }
+  removeParticipantVideoTile(targetSocketId);
+
+  if (Object.keys(peers).length === 0) {
+    updateConnectionStatus('disconnected', 'Waiting for peer...');
+    const remoteVideo = document.getElementById('remoteVideo');
+    if (remoteVideo) remoteVideo.srcObject = null;
+    const remoteAvatar = document.getElementById('remoteAvatar');
+    if (remoteAvatar) remoteAvatar.style.display = 'flex';
+  }
+}
+
+// ===== Dynamic Video Tile Rendering =====
+function renderParticipantVideoTile(socketId, displayName, mediaStream) {
+  const container = document.getElementById('remoteVideoWrap');
+  if (!container) return;
+
+  const remoteVideo = document.getElementById('remoteVideo');
+  const remoteAvatar = document.getElementById('remoteAvatar');
+
+  if (Object.keys(peers).length <= 1 && remoteVideo) {
+    remoteVideo.srcObject = mediaStream;
+    if (remoteAvatar) remoteAvatar.style.display = 'none';
+    try { remoteVideo.play().catch(e => {}); } catch(e) {}
+    return;
+  }
+
+  let tile = document.getElementById(`tile_${socketId}`);
+  if (!tile) {
+    tile = document.createElement('div');
+    tile.id = `tile_${socketId}`;
+    tile.className = 'participant-tile';
+    tile.onclick = () => focusParticipantTile(socketId);
+
+    const videoEl = document.createElement('video');
+    videoEl.id = `video_${socketId}`;
+    videoEl.autoplay = true;
+    videoEl.playsInline = true;
+
+    const badge = document.createElement('div');
+    badge.className = 'tile-badge';
+    badge.innerHTML = `<span class="quality-dot good" id="q_${socketId}"></span> <span id="name_${socketId}">${escapeHtml(displayName)}</span>`;
+
+    tile.appendChild(videoEl);
+    tile.appendChild(badge);
+    container.appendChild(tile);
+  }
+
+  const videoElement = document.getElementById(`video_${socketId}`);
+  if (videoElement && videoElement.srcObject !== mediaStream) {
+    videoElement.srcObject = mediaStream;
+    try { videoElement.play().catch(e => {}); } catch(e) {}
+  }
+}
+
+function removeParticipantVideoTile(socketId) {
+  const tile = document.getElementById(`tile_${socketId}`);
+  if (tile && tile.parentNode) {
+    tile.parentNode.removeChild(tile);
+  }
+  if (focusedSocketId === socketId) focusedSocketId = null;
+}
+
+function focusParticipantTile(socketId) {
+  focusedSocketId = (focusedSocketId === socketId) ? null : socketId;
+  const tiles = document.querySelectorAll('.participant-tile');
+  tiles.forEach(t => t.classList.remove('focused'));
+
+  if (focusedSocketId) {
+    const targetTile = document.getElementById(`tile_${socketId}`);
+    if (targetTile) targetTile.classList.add('focused');
+    toast(`Focused: ${peers[socketId]?.displayName || 'Peer'}`);
+  }
 }
 
 async function flushQueuedCandidates() {
   while (queuedCandidates.length > 0) {
-    const cand = queuedCandidates.shift();
+    const item = queuedCandidates.shift();
+    const cand = item.candidate || item;
+    const targetId = item.senderId;
+    const targetPc = (targetId && peers[targetId]) ? peers[targetId].pc : pc;
     try {
-      if (pc) await pc.addIceCandidate(new RTCIceCandidate(cand));
+      if (targetPc) await targetPc.addIceCandidate(new RTCIceCandidate(cand));
     } catch (err) {}
   }
 }
 
-async function attemptIceRestart(peer) {
-  if (isRestartingIce || !peer) return;
+async function attemptIceRestart(peerConnection) {
+  if (isRestartingIce || !peerConnection) return;
   isRestartingIce = true;
   try {
-    const offer = await peer.createOffer({ iceRestart: true });
-    await peer.setLocalDescription(offer);
+    const offer = await peerConnection.createOffer({ iceRestart: true });
+    await peerConnection.setLocalDescription(offer);
     if (socket) socket.emit('offer', roomCode, offer);
   } catch (err) {
     console.error('[Nexus] ICE restart failed:', err);
@@ -602,120 +861,17 @@ async function attemptIceRestart(peer) {
   }
 }
 
-// ===== PeerConnection & Remote Track Handling =====
-function createPeer() {
-  if (pc) {
-    try { pc.close(); } catch(e) {}
-  }
-
-  const peer = new RTCPeerConnection(rtcConfig);
-
-  peer.onconnectionstatechange = () => {
-    const state = peer.connectionState;
-    console.log('[Nexus] WebRTC connectionState:', state);
-
-    switch (state) {
-      case 'new':
-        updateConnectionStatus('connecting', 'Connecting...');
-        break;
-      case 'connecting':
-        updateConnectionStatus('connecting', reconnectAttempts > 0 ? `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...` : 'Connecting...');
-        break;
-      case 'connected':
-        reconnectAttempts = 0;
-        updateConnectionStatus('connected', 'Connected');
-        break;
-      case 'disconnected':
-      case 'failed':
-        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          reconnectAttempts++;
-          updateConnectionStatus('connecting', `Reconnecting P2P (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-          toast(`Reconnecting P2P (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-          attemptIceRestart(peer);
-        } else {
-          updateConnectionStatus('disconnected', 'Connection lost. Please reconnect.');
-          toast('P2P Connection lost. Please reconnect.');
-        }
-        break;
-      case 'closed':
-        updateConnectionStatus('disconnected', 'Call ended');
-        break;
-    }
-  };
-
-  peer.ontrack = (e) => {
-    const remoteVideo = document.getElementById('remoteVideo');
-    const remoteAvatar = document.getElementById('remoteAvatar');
-
-    if (remoteVideo) {
-      let targetStream = null;
-      if (e.streams && e.streams[0]) {
-        targetStream = e.streams[0];
-      } else {
-        if (!remoteStream) {
-          remoteStream = new MediaStream();
-        }
-        if (!remoteStream.getTracks().some(t => t.id === e.track.id)) {
-          remoteStream.addTrack(e.track);
-        }
-        targetStream = remoteStream;
-      }
-
-      if (remoteVideo.srcObject !== targetStream) {
-        remoteVideo.srcObject = targetStream;
-      }
-
-      const hasVideo = targetStream.getVideoTracks().some(t => t.readyState === 'live' || t.enabled);
-      if (remoteAvatar && (e.track.kind === 'video' || hasVideo)) {
-        remoteAvatar.style.display = 'none';
-      }
-
-      try {
-        remoteVideo.play().catch(err => {});
-      } catch (err) {}
-    }
-  };
-
-  peer.onicecandidate = (e) => {
-    if (e.candidate && socket) {
-      socket.emit('ice-candidate', roomCode, e.candidate);
-    }
-  };
-
-  peer.ondatachannel = (e) => {
-    const channel = e.channel;
-    if (channel.label === 'chat') {
-      chatChannel = channel;
-      setupChatChannelListeners(chatChannel);
-    } else if (channel.label === 'file-transfer') {
-      fileChannel = channel;
-      setupFileChannelListeners(fileChannel);
-    }
-  };
-
-  return peer;
-}
-
 // ===== Create Offer AFTER addTrack() =====
 async function createAndSendOffer() {
   pc = createPeer();
-
-  chatChannel = pc.createDataChannel('chat');
-  setupChatChannelListeners(chatChannel);
-
-  fileChannel = pc.createDataChannel('file-transfer');
-  setupFileChannelListeners(fileChannel);
-
-  if (localStream) {
-    localStream.getTracks().forEach(track => {
-      pc.addTrack(track, localStream);
-    });
-  }
-
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-
   if (socket) socket.emit('offer', roomCode, offer);
+}
+
+function createPeer() {
+  const peerObj = getOrCreatePeer('default_peer', 'Guest', true);
+  return peerObj.pc;
 }
 
 // ===== Screen Sharing & Restoration =====
@@ -737,14 +893,15 @@ async function toggleScreenShare() {
 
       if (localVideo) localVideo.srcObject = screenStream;
 
-      if (pc) {
-        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-        if (sender) await sender.replaceTrack(screenTrack);
+      for (const id in peers) {
+        const peerObj = peers[id];
+        if (peerObj && peerObj.pc) {
+          const sender = peerObj.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+          if (sender) await sender.replaceTrack(screenTrack);
+        }
       }
 
-      screenTrack.onended = () => {
-        stopScreenShare();
-      };
+      screenTrack.onended = () => { stopScreenShare(); };
 
       isScreenSharing = true;
       if (btnScreen) btnScreen.classList.add('active-danger');
@@ -774,16 +931,20 @@ function stopScreenShare() {
   const localVideo = document.getElementById('localVideo');
   if (localVideo && localStream) localVideo.srcObject = localStream;
 
-  if (pc && cameraTrack) {
-    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-    if (sender) {
-      sender.replaceTrack(cameraTrack);
-      cameraTrack.enabled = true;
+  if (cameraTrack) {
+    for (const id in peers) {
+      const peerObj = peers[id];
+      if (peerObj && peerObj.pc) {
+        const sender = peerObj.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) {
+          sender.replaceTrack(cameraTrack);
+          cameraTrack.enabled = true;
+        }
+      }
     }
   }
 
   isScreenSharing = false;
-
   const btnScreen = document.getElementById('btnScreen');
   const screenBanner = document.getElementById('screenShareBanner');
 
@@ -797,24 +958,16 @@ function stopScreenShare() {
 function setupChatChannelListeners(channel) {
   if (!channel) return;
 
-  channel.onopen = () => {
-    console.log('[Nexus] Chat DataChannel opened');
-  };
-
-  channel.onclose = () => {
-    console.log('[Nexus] Chat DataChannel closed');
-  };
-
-  channel.onerror = (err) => {
-    console.warn('[Nexus] Chat DataChannel error:', err);
-  };
+  channel.onopen = () => { console.log('[Nexus] Chat DataChannel opened'); };
+  channel.onclose = () => { console.log('[Nexus] Chat DataChannel closed'); };
+  channel.onerror = (err) => { console.warn('[Nexus] Chat DataChannel error:', err); };
 
   channel.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
       if (data && data.type === 'chat' && typeof data.text === 'string') {
         const cleanText = data.text.slice(0, 2000);
-        renderChatMessage(cleanText, 'them', data.timestamp);
+        renderChatMessage(cleanText, 'them', data.timestamp, data.sender || 'Peer');
 
         const chatDrawer = document.getElementById('chatDrawer');
         if (!chatDrawer || !chatDrawer.classList.contains('open')) {
@@ -832,21 +985,24 @@ function sendChatMessage() {
   let text = input.value.trim();
   if (!text) return;
 
-  if (text.length > 2000) {
-    text = text.substring(0, 2000);
-    toast('Message truncated to 2000 characters');
-  }
+  if (text.length > 2000) text = text.substring(0, 2000);
 
   const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const payload = JSON.stringify({ type: 'chat', text, sender: myDisplayName, timestamp });
 
-  if (chatChannel && chatChannel.readyState === 'open') {
-    chatChannel.send(JSON.stringify({ type: 'chat', text, timestamp }));
-  } else {
-    toast('Chat channel not connected yet');
-    return;
+  let sent = false;
+  for (const id in peers) {
+    const ch = peers[id]?.chatChannel || chatChannel;
+    if (ch && ch.readyState === 'open') {
+      try { ch.send(payload); sent = true; } catch(e) {}
+    }
   }
 
-  renderChatMessage(text, 'me', timestamp);
+  if (chatChannel && chatChannel.readyState === 'open' && !sent) {
+    try { chatChannel.send(payload); sent = true; } catch(e) {}
+  }
+
+  renderChatMessage(text, 'me', timestamp, myDisplayName);
   input.value = '';
 }
 
@@ -857,13 +1013,19 @@ function handleChatKeyDown(e) {
   }
 }
 
-// Safe DOM Rendering for Chat Messages (NO innerHTML for untrusted input)
-function renderChatMessage(text, sender, timestamp) {
+function renderChatMessage(text, sender, timestamp, senderName) {
   const container = document.getElementById('chatMessages');
   if (!container) return;
 
   const bubble = document.createElement('div');
   bubble.className = `msg-bubble ${sender}`;
+
+  if (senderName && sender === 'them') {
+    const nameNode = document.createElement('div');
+    nameNode.style.cssText = 'font-weight:600; font-size:11px; margin-bottom:2px; color:var(--accent);';
+    nameNode.textContent = senderName;
+    bubble.appendChild(nameNode);
+  }
 
   const textNode = document.createElement('div');
   textNode.textContent = text;
@@ -895,20 +1057,16 @@ function updateChatBadge() {
   }
 }
 
-// ===== P2P File Transfer DataChannel (Backpressure & Safety) =====
+// ===== P2P File Transfer DataChannel =====
 function setupFileChannelListeners(channel) {
   if (!channel) return;
   channel.binaryType = 'arraybuffer';
 
-  channel.onopen = () => {
-    console.log('[Nexus] File DataChannel opened');
-  };
-
+  channel.onopen = () => { console.log('[Nexus] File DataChannel opened'); };
   channel.onclose = () => {
     console.log('[Nexus] File DataChannel closed');
     cleanupIncompleteTransfers('Channel closed');
   };
-
   channel.onerror = (err) => {
     console.warn('[Nexus] File DataChannel error:', err);
     cleanupIncompleteTransfers('Channel error');
@@ -1000,7 +1158,8 @@ function handleFileSelect(e) {
 }
 
 async function processAndSendFiles(files) {
-  if (!fileChannel || fileChannel.readyState !== 'open') {
+  const targetChannel = getActiveFileChannel();
+  if (!targetChannel || targetChannel.readyState !== 'open') {
     toast('P2P connection not connected for files');
     return;
   }
@@ -1015,16 +1174,23 @@ async function processAndSendFiles(files) {
       toast(`File ${file.name} exceeds 500MB limit`);
       continue;
     }
-    await sendSingleFile(file);
+    await sendSingleFile(file, targetChannel);
   }
 }
 
-async function sendSingleFile(file) {
+function getActiveFileChannel() {
+  for (const id in peers) {
+    if (peers[id]?.fileChannel?.readyState === 'open') return peers[id].fileChannel;
+  }
+  return fileChannel;
+}
+
+async function sendSingleFile(file, channel) {
   const fileId = 'file_' + Math.random().toString(36).substr(2, 9);
   activeFileTransfers[fileId] = { cancelled: false, startTime: Date.now() };
 
   try {
-    fileChannel.send(JSON.stringify({
+    channel.send(JSON.stringify({
       type: 'file-start',
       id: fileId,
       name: file.name,
@@ -1040,30 +1206,29 @@ async function sendSingleFile(file) {
   createFileProgressUI(fileId, file.name, file.size, true);
 
   let offset = 0;
-  fileChannel.bufferedAmountLowThreshold = 64 * 1024; // 64 KB threshold
+  channel.bufferedAmountLowThreshold = 64 * 1024;
 
   while (offset < file.size) {
-    if (activeFileTransfers[fileId]?.cancelled || fileChannel.readyState !== 'open') {
+    if (activeFileTransfers[fileId]?.cancelled || channel.readyState !== 'open') {
       break;
     }
 
-    // Backpressure handling: wait when buffer exceeds 128 KB
-    if (fileChannel.bufferedAmount > 128 * 1024) {
+    if (channel.bufferedAmount > 128 * 1024) {
       await new Promise(resolve => {
         let timeout = setTimeout(() => {
-          fileChannel.onbufferedamountlow = null;
+          channel.onbufferedamountlow = null;
           resolve();
         }, 1000);
 
-        fileChannel.onbufferedamountlow = () => {
+        channel.onbufferedamountlow = () => {
           clearTimeout(timeout);
-          fileChannel.onbufferedamountlow = null;
+          channel.onbufferedamountlow = null;
           resolve();
         };
       });
     }
 
-    if (activeFileTransfers[fileId]?.cancelled || fileChannel.readyState !== 'open') {
+    if (activeFileTransfers[fileId]?.cancelled || channel.readyState !== 'open') {
       break;
     }
 
@@ -1071,7 +1236,7 @@ async function sendSingleFile(file) {
     const buffer = await slice.arrayBuffer();
 
     try {
-      fileChannel.send(buffer);
+      channel.send(buffer);
     } catch (err) {
       console.warn('[Nexus] Send chunk error:', err);
       break;
@@ -1100,7 +1265,7 @@ async function sendSingleFile(file) {
 
   delete activeFileTransfers[fileId];
   try {
-    fileChannel.send(JSON.stringify({ type: 'file-end', id: fileId }));
+    channel.send(JSON.stringify({ type: 'file-end', id: fileId }));
     toast(`Sent file: ${file.name}`);
   } catch (err) {}
 }
@@ -1141,9 +1306,10 @@ function cancelFileTransfer(id) {
   if (incomingFileTransfers[id]) {
     delete incomingFileTransfers[id];
   }
-  if (fileChannel && fileChannel.readyState === 'open') {
+  const targetChannel = getActiveFileChannel();
+  if (targetChannel && targetChannel.readyState === 'open') {
     try {
-      fileChannel.send(JSON.stringify({ type: 'file-cancel', id }));
+      targetChannel.send(JSON.stringify({ type: 'file-cancel', id }));
     } catch (e) {}
   }
   const status = document.getElementById(`status_${id}`);
@@ -1174,7 +1340,7 @@ function finishFileDownload(id, filename, downloadUrl) {
   }
 }
 
-// ===== Audio & Video Media Toggles =====
+// ===== Audio & Video Controls =====
 function toggleAudio() {
   if (!localStream) {
     toast('Media stream not active');
@@ -1190,42 +1356,9 @@ function toggleAudio() {
   audioTrack.enabled = !audioTrack.enabled;
   if (btn) btn.classList.toggle('off', !audioTrack.enabled);
   toast(audioTrack.enabled ? 'Mic Unmuted' : 'Mic Muted');
-}
 
-function setRemoteVolume(val) {
-  const remoteVideo = document.getElementById('remoteVideo');
-  const volVal = document.getElementById('volVal');
-  const settingsVolVal = document.getElementById('settingsVolVal');
-  const volumeSlider = document.getElementById('volumeSlider');
-  const settingsVolumeSlider = document.getElementById('settingsVolumeSlider');
-  const volumeIcon = document.getElementById('volumeIcon');
-
-  const vol = Math.max(0, Math.min(100, parseInt(val, 10) || 0));
-  const volumeDecimal = vol / 100;
-
-  if (remoteVideo) {
-    remoteVideo.volume = volumeDecimal;
-  }
-  if (volVal) volVal.textContent = `${vol}%`;
-  if (settingsVolVal) settingsVolVal.textContent = `${vol}%`;
-  if (volumeSlider) volumeSlider.value = vol;
-  if (settingsVolumeSlider) settingsVolumeSlider.value = vol;
-
-  if (volumeIcon) {
-    if (vol === 0) {
-      volumeIcon.innerHTML = '<path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73 4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>';
-    } else if (vol < 50) {
-      volumeIcon.innerHTML = '<path d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z"/>';
-    } else {
-      volumeIcon.innerHTML = '<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>';
-    }
-  }
-}
-
-function toggleVolumeSlider() {
-  const popup = document.getElementById('volumePopup');
-  if (popup) {
-    popup.classList.toggle('open');
+  if (socket) {
+    socket.emit('peer-state-change', roomCode, { audioEnabled: audioTrack.enabled });
   }
 }
 
@@ -1236,62 +1369,362 @@ function toggleVideo() {
   }
   const videoTrack = localStream.getVideoTracks()?.[0];
   const btn = document.getElementById('btnVideo');
-  const avatar = document.getElementById('localAvatar');
+  const localAvatar = document.getElementById('localAvatar');
 
   if (!videoTrack) {
-    toast('No camera track available');
+    toast('No video track available');
     return;
   }
 
   videoTrack.enabled = !videoTrack.enabled;
   if (btn) btn.classList.toggle('off', !videoTrack.enabled);
-  if (avatar) avatar.style.display = videoTrack.enabled ? 'none' : 'flex';
-
+  if (localAvatar) localAvatar.style.display = videoTrack.enabled ? 'none' : 'flex';
   toast(videoTrack.enabled ? 'Camera Enabled' : 'Camera Disabled');
-}
 
-// ===== Fullscreen =====
-function fullscreenPage() {
-  const elem = document.documentElement;
-  try {
-    if (!document.fullscreenElement && !document.webkitFullscreenElement) {
-      if (elem.requestFullscreen) elem.requestFullscreen();
-      else if (elem.webkitRequestFullscreen) elem.webkitRequestFullscreen();
-      else if (elem.msRequestFullscreen) elem.msRequestFullscreen();
-    } else {
-      if (document.exitFullscreen) document.exitFullscreen();
-      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-    }
-  } catch (err) {
-    toast('Fullscreen toggle failed');
+  if (socket) {
+    socket.emit('peer-state-change', roomCode, { videoEnabled: videoTrack.enabled });
   }
 }
 
+function toggleMirrorVideo(mirror) {
+  const localVideoWrap = document.getElementById('localVideoWrap');
+  if (localVideoWrap) {
+    localVideoWrap.classList.toggle('mirror', mirror);
+  }
+}
+
+function toggleVolumeSlider() {
+  const popup = document.getElementById('volumePopup');
+  if (popup) popup.classList.toggle('open');
+}
+
+function setRemoteVolume(val) {
+  const volVal = document.getElementById('volVal');
+  const settingsVolVal = document.getElementById('settingsVolVal');
+  const volumeSlider = document.getElementById('volumeSlider');
+  const settingsVolumeSlider = document.getElementById('settingsVolumeSlider');
+
+  if (volVal) volVal.textContent = `${val}%`;
+  if (settingsVolVal) settingsVolVal.textContent = `${val}%`;
+  if (volumeSlider) volumeSlider.value = val;
+  if (settingsVolumeSlider) settingsVolumeSlider.value = val;
+
+  const audioElements = document.querySelectorAll('video');
+  audioElements.forEach(video => {
+    if (video.id !== 'localVideo') {
+      video.volume = val / 100;
+    }
+  });
+}
+
+function fullscreenPage() {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch(err => {
+      toast('Fullscreen not supported');
+    });
+  } else {
+    document.exitFullscreen();
+  }
+}
+
+// ===== Picture-in-Picture Control =====
+async function togglePictureInPicture() {
+  if (!document.pictureInPictureEnabled) {
+    toast('Picture-in-Picture is not supported in this browser');
+    return;
+  }
+
+  try {
+    if (document.pictureInPictureElement) {
+      await document.exitPictureInPicture();
+    } else {
+      const activeVideo = document.getElementById('remoteVideo') || document.getElementById('localVideo');
+      if (activeVideo && activeVideo.srcObject) {
+        await activeVideo.requestPictureInPicture();
+      } else {
+        toast('No active video stream for Picture-in-Picture');
+      }
+    }
+  } catch (err) {
+    console.warn('[Nexus] Picture-in-Picture failed:', err);
+    toast('Picture-in-Picture failed');
+  }
+}
+
+// ===== Device & Quality Switchers =====
+async function switchVideoDevice(deviceId) {
+  selectedVideoDeviceId = deviceId;
+  if (!localStream) return;
+
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: deviceId } }
+    });
+    const newVideoTrack = newStream.getVideoTracks()[0];
+    const oldTrack = localStream.getVideoTracks()[0];
+
+    if (oldTrack) {
+      localStream.removeTrack(oldTrack);
+      oldTrack.stop();
+    }
+    localStream.addTrack(newVideoTrack);
+
+    const localVideo = document.getElementById('localVideo');
+    if (localVideo) localVideo.srcObject = localStream;
+
+    for (const id in peers) {
+      const peerObj = peers[id];
+      if (peerObj && peerObj.pc) {
+        const sender = peerObj.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) await sender.replaceTrack(newVideoTrack);
+      }
+    }
+    toast('Camera updated');
+  } catch (err) {
+    toast('Failed to switch camera device');
+  }
+}
+
+async function switchAudioDevice(deviceId) {
+  selectedAudioDeviceId = deviceId;
+  if (!localStream) return;
+
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: { exact: deviceId } }
+    });
+    const newAudioTrack = newStream.getAudioTracks()[0];
+    const oldTrack = localStream.getAudioTracks()[0];
+
+    if (oldTrack) {
+      localStream.removeTrack(oldTrack);
+      oldTrack.stop();
+    }
+    localStream.addTrack(newAudioTrack);
+
+    for (const id in peers) {
+      const peerObj = peers[id];
+      if (peerObj && peerObj.pc) {
+        const sender = peerObj.pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+        if (sender) await sender.replaceTrack(newAudioTrack);
+      }
+    }
+    toast('Microphone updated');
+  } catch (err) {
+    toast('Failed to switch microphone device');
+  }
+}
+
+async function switchAudioOutputDevice(deviceId) {
+  selectedAudioOutputDeviceId = deviceId;
+  const audioElements = document.querySelectorAll('video, audio');
+  audioElements.forEach(el => {
+    if (typeof el.setSinkId === 'function') {
+      el.setSinkId(deviceId).catch(err => console.warn('setSinkId failed:', err));
+    }
+  });
+  toast('Audio output updated');
+}
+
+async function changeVideoQuality(resolution) {
+  selectedVideoQuality = resolution;
+  if (!localStream) return;
+
+  const videoTrack = localStream.getVideoTracks()[0];
+  if (!videoTrack) return;
+
+  let idealHeight = 720;
+  let idealWidth = 1280;
+
+  if (resolution === '1080') { idealWidth = 1920; idealHeight = 1080; }
+  else if (resolution === '720') { idealWidth = 1280; idealHeight = 720; }
+  else if (resolution === '480') { idealWidth = 854; idealHeight = 480; }
+  else if (resolution === '360') { idealWidth = 640; idealHeight = 360; }
+
+  try {
+    if (resolution !== 'auto') {
+      await videoTrack.applyConstraints({
+        width: { ideal: idealWidth },
+        height: { ideal: idealHeight }
+      });
+    } else {
+      await videoTrack.applyConstraints({ width: { ideal: 1280 }, height: { ideal: 720 } });
+    }
+    toast(`Video quality set to ${resolution.toUpperCase()}`);
+  } catch (err) {
+    console.warn('[Nexus] Quality constraint application error:', err);
+  }
+}
+
+function togglePushToTalk(enabled) {
+  isPushToTalk = enabled;
+  const audioTrack = localStream?.getAudioTracks()?.[0];
+  const btn = document.getElementById('btnAudio');
+
+  if (isPushToTalk) {
+    if (audioTrack) audioTrack.enabled = false;
+    if (btn) btn.classList.add('off');
+    toast('Push-to-Talk ON (Hold Space to talk)');
+  } else {
+    if (audioTrack) audioTrack.enabled = true;
+    if (btn) btn.classList.remove('off');
+    toast('Push-to-Talk OFF');
+  }
+}
+
+// ===== Connection Diagnostics & Stats Monitoring =====
+function startStatsMonitoring() {
+  if (statsIntervalId) clearInterval(statsIntervalId);
+  statsIntervalId = setInterval(() => {
+    updateDiagnosticsOutput();
+  }, 2500);
+}
+
+async function updateDiagnosticsOutput() {
+  const output = document.getElementById('diagnosticsOutput');
+  if (!output) return;
+
+  let html = '';
+  for (const id in peers) {
+    const peerObj = peers[id];
+    if (peerObj && peerObj.pc) {
+      try {
+        const stats = await peerObj.pc.getStats();
+        let rtt = null;
+        let packetsLost = 0;
+        let fps = null;
+        let resHeight = null;
+        let bytesReceived = 0;
+        let bytesSent = 0;
+
+        stats.forEach(report => {
+          if (report.type === 'remote-inbound-rtp' && report.roundTripTime) {
+            rtt = Math.round(report.roundTripTime * 1000);
+          }
+          if (report.type === 'inbound-rtp' && report.kind === 'video') {
+            packetsLost = report.packetsLost || 0;
+            fps = report.framesPerSecond;
+            bytesReceived = report.bytesReceived || 0;
+          }
+          if (report.type === 'outbound-rtp' && report.kind === 'video') {
+            bytesSent = report.bytesSent || 0;
+          }
+          if (report.type === 'track' && report.kind === 'video') {
+            resHeight = report.frameHeight;
+          }
+        });
+
+        const quality = (!rtt || rtt < 60) ? 'excellent' : (rtt < 130 ? 'good' : (rtt < 260 ? 'fair' : 'poor'));
+        peerObj.quality = quality;
+
+        const dotEl = document.getElementById(`q_${id}`);
+        if (dotEl) dotEl.className = `quality-dot ${quality}`;
+
+        html += `
+          <div style="border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 4px;">
+            <div><strong>Peer (${peerObj.displayName || id.slice(0, 6)}):</strong> <span class="quality-dot ${quality}"></span> ${quality.toUpperCase()}</div>
+            <div>Latency (RTT): ${rtt !== null ? rtt + ' ms' : 'N/A'}</div>
+            <div>Packets Lost: ${packetsLost}</div>
+            <div>Video: ${resHeight ? resHeight + 'p' : 'N/A'} ${fps ? '· ' + fps + ' FPS' : ''}</div>
+            <div>Data: ${formatBytes(bytesReceived)} RX / ${formatBytes(bytesSent)} TX</div>
+          </div>
+        `;
+      } catch (err) {}
+    }
+  }
+
+  if (!html) html = '<div>No active WebRTC peer connections.</div>';
+  output.innerHTML = html;
+}
+
+// ===== Settings Tabs Navigation =====
+function switchSettingsTab(tabName) {
+  const navBtns = document.querySelectorAll('.settings-nav .tab-btn');
+  navBtns.forEach(btn => btn.classList.remove('active'));
+
+  const activeBtn = Array.from(navBtns).find(btn => btn.getAttribute('onclick')?.includes(tabName));
+  if (activeBtn) activeBtn.classList.add('active');
+
+  const tabContents = document.querySelectorAll('.tab-content');
+  tabContents.forEach(tab => tab.style.display = 'none');
+
+  const targetTab = document.getElementById(`tab-${tabName}`);
+  if (targetTab) targetTab.style.display = 'flex';
+
+  if (tabName === 'devices') populateDeviceLists();
+  if (tabName === 'diagnostics') updateDiagnosticsOutput();
+}
+
+async function populateDeviceLists() {
+  const videoSelect = document.getElementById('videoInputSelect');
+  const audioInputSelect = document.getElementById('audioInputSelect');
+  const audioOutputSelect = document.getElementById('audioOutputSelect');
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    if (videoSelect) videoSelect.innerHTML = '';
+    if (audioInputSelect) audioInputSelect.innerHTML = '';
+    if (audioOutputSelect) audioOutputSelect.innerHTML = '';
+
+    devices.forEach(device => {
+      const option = document.createElement('option');
+      option.value = device.deviceId;
+      option.textContent = device.label || `${device.kind} (${device.deviceId.slice(0, 5)}...)`;
+
+      if (device.kind === 'videoinput' && videoSelect) {
+        if (selectedVideoDeviceId && device.deviceId === selectedVideoDeviceId) option.selected = true;
+        videoSelect.appendChild(option);
+      } else if (device.kind === 'audioinput' && audioInputSelect) {
+        if (selectedAudioDeviceId && device.deviceId === selectedAudioDeviceId) option.selected = true;
+        audioInputSelect.appendChild(option);
+      } else if (device.kind === 'audiooutput' && audioOutputSelect) {
+        if (selectedAudioOutputDeviceId && device.deviceId === selectedAudioOutputDeviceId) option.selected = true;
+        audioOutputSelect.appendChild(option);
+      }
+    });
+  } catch (err) {
+    console.warn('[Nexus] Device enumeration failed:', err);
+  }
+}
+
+function updateRoomSummaryInfo(data) {
+  const infoCode = document.getElementById('infoRoomCode');
+  const infoMax = document.getElementById('infoMaxMembers');
+  const infoPin = document.getElementById('infoPinStatus');
+
+  if (infoCode && roomCode) infoCode.textContent = roomCode;
+  if (infoMax && data) infoMax.textContent = `${data.members ? data.members.length : 1} / ${data.maxMembers} Members`;
+  if (infoPin && data) infoPin.textContent = data.protected ? 'Protected (PIN)' : 'Unprotected';
+}
+
+// ===== Drawer & Modal Visibility Handlers =====
 function toggleDrawer(type) {
   const chatDrawer = document.getElementById('chatDrawer');
   const fileDrawer = document.getElementById('fileDrawer');
 
   if (type === 'chat') {
-    fileDrawer?.classList.remove('open');
-    chatDrawer?.classList.toggle('open');
-    if (chatDrawer?.classList.contains('open')) {
-      unreadChatCount = 0;
-      updateChatBadge();
-      document.getElementById('chatInput')?.focus();
+    if (fileDrawer) fileDrawer.classList.remove('open');
+    if (chatDrawer) {
+      chatDrawer.classList.toggle('open');
+      if (chatDrawer.classList.contains('open')) {
+        unreadChatCount = 0;
+        updateChatBadge();
+        const chatInput = document.getElementById('chatInput');
+        if (chatInput) setTimeout(() => chatInput.focus(), 100);
+      }
     }
   } else if (type === 'file') {
-    chatDrawer?.classList.remove('open');
-    fileDrawer?.classList.toggle('open');
+    if (chatDrawer) chatDrawer.classList.remove('open');
+    if (fileDrawer) fileDrawer.classList.toggle('open');
   }
 }
 
-// ===== Settings & Media Devices Switcher =====
 function openSettings() {
   const modal = document.getElementById('settingsModal');
-  if (modal) {
-    modal.classList.add('open');
-    populateMediaDevices();
-  }
+  if (modal) modal.classList.add('open');
+  switchSettingsTab('general');
 }
 
 function closeSettings() {
@@ -1299,97 +1732,6 @@ function closeSettings() {
   if (modal) modal.classList.remove('open');
 }
 
-async function populateMediaDevices() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const audioSelect = document.getElementById('audioInputSelect');
-    const videoSelect = document.getElementById('videoInputSelect');
-
-    if (audioSelect) audioSelect.innerHTML = '';
-    if (videoSelect) videoSelect.innerHTML = '';
-
-    devices.forEach(device => {
-      const option = document.createElement('option');
-      option.value = device.deviceId;
-      option.textContent = device.label || `${device.kind === 'audioinput' ? 'Mic' : 'Cam'} (${device.deviceId.substr(0, 5)})`;
-
-      if (device.kind === 'audioinput' && audioSelect) {
-        audioSelect.appendChild(option);
-      } else if (device.kind === 'videoinput' && videoSelect) {
-        videoSelect.appendChild(option);
-      }
-    });
-  } catch (err) {}
-}
-
-async function switchAudioDevice(deviceId) {
-  if (!localStream || !deviceId) return;
-  try {
-    const newStream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId } } });
-    const newTrack = newStream.getAudioTracks()[0];
-
-    const oldTrack = localStream.getAudioTracks()[0];
-    if (oldTrack) {
-      localStream.removeTrack(oldTrack);
-      oldTrack.stop();
-    }
-    localStream.addTrack(newTrack);
-
-    if (pc) {
-      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
-      if (sender) await sender.replaceTrack(newTrack);
-    }
-    toast('Audio input updated');
-  } catch (err) {
-    toast('Failed to switch audio input');
-  }
-}
-
-async function switchVideoDevice(deviceId) {
-  if (!localStream || !deviceId) return;
-  try {
-    const newStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId } } });
-    const newTrack = newStream.getVideoTracks()[0];
-
-    const oldTrack = localStream.getVideoTracks()[0];
-    if (oldTrack) {
-      localStream.removeTrack(oldTrack);
-      oldTrack.stop();
-    }
-    localStream.addTrack(newTrack);
-
-    const localVideo = document.getElementById('localVideo');
-    if (localVideo) {
-      localVideo.srcObject = localStream;
-      localVideo.play().catch(e => {});
-    }
-
-    if (pc && !isScreenSharing) {
-      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-      if (sender) await sender.replaceTrack(newTrack);
-    }
-    toast('Camera updated');
-  } catch (err) {
-    toast('Failed to switch camera');
-  }
-}
-
-function toggleMirrorVideo(isMirrored) {
-  const wrap = document.getElementById('localVideoWrap');
-  if (wrap) {
-    if (isMirrored) wrap.classList.add('mirror');
-    else wrap.classList.remove('mirror');
-  }
-}
-
-function clearPreferences() {
-  localStorage.clear();
-  changeTheme('cyber');
-  toast('Preferences reset');
-}
-
-// ===== End Call & Stop All Tracks =====
 function confirmEndCall() {
   const modal = document.getElementById('endCallModal');
   if (modal) modal.classList.add('open');
@@ -1401,29 +1743,17 @@ function closeEndCallModal() {
 }
 
 function leaveRoom() {
+  if (statsIntervalId) clearInterval(statsIntervalId);
   if (localStream) {
     localStream.getTracks().forEach(track => track.stop());
     localStream = null;
-  }
-  if (remoteStream) {
-    remoteStream.getTracks().forEach(track => track.stop());
-    remoteStream = null;
   }
   if (screenStream) {
     screenStream.getTracks().forEach(track => track.stop());
     screenStream = null;
   }
-  if (chatChannel) {
-    try { chatChannel.close(); } catch(e) {}
-    chatChannel = null;
-  }
-  if (fileChannel) {
-    try { fileChannel.close(); } catch(e) {}
-    fileChannel = null;
-  }
-  if (pc) {
-    try { pc.close(); } catch(e) {}
-    pc = null;
+  for (const id in peers) {
+    try { peers[id].pc.close(); } catch(e) {}
   }
   if (socket) {
     try { socket.disconnect(); } catch(e) {}
@@ -1524,7 +1854,7 @@ function togglePinInput(showPin) {
 }
 
 function generateSecureRoomCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 32 unambiguous alphanumeric characters
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const array = new Uint8Array(6);
   window.crypto.getRandomValues(array);
   let code = '';
@@ -1537,6 +1867,8 @@ function generateSecureRoomCode() {
 function submitCreateRoom() {
   const radioProtected = document.getElementById('radioPinProtected') || document.querySelector('input[name="roomPinOption"][value="pin"]');
   const pinInput = document.getElementById('createPinInput');
+  const maxMembersSelect = document.getElementById('createMaxMembers');
+  const nameInput = document.getElementById('createDisplayName');
   const errBox = document.getElementById('createPinError');
 
   let pinVal = null;
@@ -1551,9 +1883,15 @@ function submitCreateRoom() {
     }
   }
 
+  const maxMembers = maxMembersSelect ? maxMembersSelect.value : '2';
+  const displayName = nameInput && nameInput.value.trim() ? nameInput.value.trim() : 'Host';
+
   const code = generateSecureRoomCode();
   sessionStorage.setItem('nexus_host_' + code, 'true');
   sessionStorage.setItem('linkdrop_host_' + code, 'true');
+  sessionStorage.setItem('nexus_name', displayName);
+  sessionStorage.setItem('nexus_max_' + code, maxMembers);
+
   if (pinVal) {
     sessionStorage.setItem('nexus_pin_' + code, pinVal);
     sessionStorage.setItem('linkdrop_pin_' + code, pinVal);
@@ -1562,15 +1900,6 @@ function submitCreateRoom() {
   window.location.href = `/room/${code}`;
 }
 
-
-function handleGuestPinKeyDown(e) {
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    submitGuestPin();
-  }
-}
-
-// ===== Guest PIN Validation Handler =====
 function submitGuestPin() {
   const pinInput = document.getElementById('guestPinInput');
   const errBox = document.getElementById('pinErrorBox');

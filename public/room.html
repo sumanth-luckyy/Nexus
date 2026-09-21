@@ -190,49 +190,124 @@
 
   <!-- Settings Modal -->
   <div id="settingsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
-    <div class="modal-content">
+    <div class="modal-content" style="max-height: 85dvh; overflow-y: auto;">
       <h2 id="settingsTitle">Settings</h2>
 
-      <div class="form-group">
-        <label for="themeSelect">Theme</label>
-        <select id="themeSelect" onchange="changeTheme(this.value)">
-          <option value="cyber">Cyber (Default Cyan)</option>
-          <option value="dark">Dark Blue</option>
-          <option value="light">Light Mode</option>
-          <option value="amoled">AMOLED Pitch Black</option>
-        </select>
+      <!-- Navigation Tabs -->
+      <div class="settings-nav" style="display: flex; gap: 6px; border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 8px; overflow-x: auto;">
+        <button class="tab-btn active" onclick="switchSettingsTab('general')">General</button>
+        <button class="tab-btn" onclick="switchSettingsTab('devices')">Devices</button>
+        <button class="tab-btn" onclick="switchSettingsTab('quality')">Quality</button>
+        <button class="tab-btn" onclick="switchSettingsTab('diagnostics')">Diagnostics</button>
+        <button class="tab-btn" onclick="switchSettingsTab('shortcuts')">Shortcuts</button>
       </div>
 
-      <div class="form-group">
-        <label for="audioInputSelect">Microphone</label>
-        <select id="audioInputSelect" onchange="switchAudioDevice(this.value)"></select>
+      <!-- Tab: General -->
+      <div id="tab-general" class="tab-content" style="display: flex; flex-direction: column; gap: 14px;">
+        <div class="form-group">
+          <label for="themeSelect">Theme</label>
+          <select id="themeSelect" onchange="changeTheme(this.value)">
+            <option value="cyber">Cyber (Default Cyan)</option>
+            <option value="dark">Dark Blue</option>
+            <option value="light">Light Mode</option>
+            <option value="amoled">AMOLED Pitch Black</option>
+          </select>
+        </div>
+
+        <div class="form-group" style="flex-direction: row; align-items: center; justify-content: space-between;">
+          <label for="chkMirror">Mirror Local Video</label>
+          <input type="checkbox" id="chkMirror" checked onchange="toggleMirrorVideo(this.checked)" />
+        </div>
+
+        <div class="form-group" style="flex-direction: row; align-items: center; justify-content: space-between;">
+          <label for="chkPtt">Push-to-Talk (Hold Space key to unmute)</label>
+          <input type="checkbox" id="chkPtt" onchange="togglePushToTalk(this.checked)" />
+        </div>
+
+        <div class="form-group">
+          <label>Room Summary</label>
+          <div style="background: var(--bg-secondary); border: 1px solid var(--border); padding: 10px; border-radius: 8px; font-size: 12px; display: flex; flex-direction: column; gap: 4px;">
+            <div>Code: <strong id="infoRoomCode">—</strong></div>
+            <div>Capacity: <span id="infoMaxMembers">—</span></div>
+            <div>Protection: <span id="infoPinStatus">—</span></div>
+          </div>
+        </div>
       </div>
 
-      <div class="form-group">
-        <label for="settingsVolumeSlider">Sound Volume (<span id="settingsVolVal">100%</span>)</label>
-        <input type="range" id="settingsVolumeSlider" min="0" max="100" value="100" style="accent-color: var(--accent); cursor: pointer; height: 6px; border-radius: 3px;" oninput="setRemoteVolume(this.value)" />
+      <!-- Tab: Devices -->
+      <div id="tab-devices" class="tab-content" style="display: none; flex-direction: column; gap: 14px;">
+        <div class="form-group">
+          <label for="videoInputSelect">Camera Device</label>
+          <select id="videoInputSelect" onchange="switchVideoDevice(this.value)"></select>
+        </div>
+
+        <div class="form-group">
+          <label for="audioInputSelect">Microphone Device</label>
+          <select id="audioInputSelect" onchange="switchAudioDevice(this.value)"></select>
+        </div>
+
+        <div class="form-group">
+          <label for="audioOutputSelect">Speaker Output Device</label>
+          <select id="audioOutputSelect" onchange="switchAudioOutputDevice(this.value)"></select>
+        </div>
+
+        <div class="form-group">
+          <label for="settingsVolumeSlider">Sound Volume (<span id="settingsVolVal">100%</span>)</label>
+          <input type="range" id="settingsVolumeSlider" min="0" max="100" value="100" style="accent-color: var(--accent); cursor: pointer; height: 6px; border-radius: 3px;" oninput="setRemoteVolume(this.value)" />
+        </div>
       </div>
 
-      <div class="form-group">
-        <label for="videoInputSelect">Camera</label>
-        <select id="videoInputSelect" onchange="switchVideoDevice(this.value)"></select>
+      <!-- Tab: Quality -->
+      <div id="tab-quality" class="tab-content" style="display: none; flex-direction: column; gap: 14px;">
+        <div class="form-group">
+          <label for="videoQualitySelect">Video Resolution Quality</label>
+          <select id="videoQualitySelect" onchange="changeVideoQuality(this.value)">
+            <option value="auto" selected>Auto (Adaptive)</option>
+            <option value="1080">1080p (Full HD)</option>
+            <option value="720">720p (HD)</option>
+            <option value="480">480p (SD)</option>
+            <option value="360">360p (Low Bandwidth)</option>
+          </select>
+        </div>
       </div>
 
-      <div class="form-group" style="flex-direction: row; align-items: center; justify-content: space-between;">
-        <label for="chkMirror">Mirror Local Video</label>
-        <input type="checkbox" id="chkMirror" checked onchange="toggleMirrorVideo(this.checked)" />
+      <!-- Tab: Connection Diagnostics -->
+      <div id="tab-diagnostics" class="tab-content" style="display: none; flex-direction: column; gap: 10px;">
+        <div style="font-size: 12px; color: var(--muted);">Real-Time WebRTC Peer Metrics (getStats)</div>
+        <div id="diagnosticsOutput" style="background: var(--bg-secondary); border: 1px solid var(--border); padding: 10px; border-radius: 8px; font-size: 12px; display: flex; flex-direction: column; gap: 6px; font-family: monospace;">
+          Loading diagnostics...
+        </div>
       </div>
 
-      <div class="form-group">
-        <label>Share Room</label>
-        <div style="display: flex; gap: 8px;">
-          <button class="ghost-btn" style="flex: 1;" onclick="openQrModal()">📱 Show QR Code</button>
-          <button class="ghost-btn" style="flex: 1;" onclick="copyLink()">🔗 Copy Link</button>
+      <!-- Tab: Keyboard Shortcuts -->
+      <div id="tab-shortcuts" class="tab-content" style="display: none; flex-direction: column; gap: 8px;">
+        <div style="display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--border);">
+          <span>Toggle Microphone</span>
+          <kbd style="background: var(--surface-solid); border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; font-family: monospace;">M</kbd>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--border);">
+          <span>Toggle Camera</span>
+          <kbd style="background: var(--surface-solid); border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; font-family: monospace;">V</kbd>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--border);">
+          <span>Share Screen</span>
+          <kbd style="background: var(--surface-solid); border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; font-family: monospace;">S</kbd>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--border);">
+          <span>Toggle Fullscreen</span>
+          <kbd style="background: var(--surface-solid); border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; font-family: monospace;">F</kbd>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--border);">
+          <span>Toggle Chat</span>
+          <kbd style="background: var(--surface-solid); border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; font-family: monospace;">C</kbd>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0;">
+          <span>Push-to-Talk (when enabled)</span>
+          <kbd style="background: var(--surface-solid); border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; font-family: monospace;">Space (Hold)</kbd>
         </div>
       </div>
 
       <div class="modal-buttons">
-        <button class="ghost-btn" onclick="clearPreferences()">Reset Defaults</button>
         <button class="btn-primary" onclick="closeSettings()">Done</button>
       </div>
     </div>

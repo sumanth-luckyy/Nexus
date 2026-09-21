@@ -75,6 +75,10 @@
         <input id="joinCode" type="text" inputmode="latin-prose" maxlength="6"
                placeholder="Enter 6-char code (e.g. A1B2C3)" aria-label="Room code">
       </div>
+      <div class="form-group">
+        <label for="joinDisplayName">Your Display Name (Optional)</label>
+        <input id="joinDisplayName" type="text" maxlength="32" placeholder="e.g. Sumanth" aria-label="Display Name">
+      </div>
       <div class="modal-buttons">
         <button class="ghost-btn" onclick="closeJoin()">Cancel</button>
         <button class="btn-primary" onclick="submitJoin()">Join Room</button>
@@ -121,6 +125,26 @@
   <div id="createRoomModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="createTitle">
     <div class="modal-content">
       <h2 id="createTitle">Create a Room</h2>
+
+      <div class="form-group">
+        <label for="createDisplayName">Your Display Name (Optional)</label>
+        <input id="createDisplayName" type="text" maxlength="32" placeholder="e.g. Sumanth" aria-label="Display Name">
+      </div>
+
+      <div class="form-group">
+        <label for="createMaxMembers">Maximum Members</label>
+        <select id="createMaxMembers" aria-label="Maximum Members">
+          <option value="2" selected>2 Members (Default 1-on-1)</option>
+          <option value="3">3 Members</option>
+          <option value="4">4 Members</option>
+          <option value="5">5 Members</option>
+          <option value="6">6 Members</option>
+          <option value="7">7 Members</option>
+          <option value="8">8 Members</option>
+          <option value="9">9 Members</option>
+          <option value="10">10 Members</option>
+        </select>
+      </div>
 
       <div class="form-group">
         <label>Room Security</label>
