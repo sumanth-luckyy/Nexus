@@ -2,73 +2,84 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>LinkDrop — Private P2P Rooms</title>
+  <title>Nexus — Connect. Communicate. Share.</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#000000" />
+  <meta name="description" content="Nexus — Instant, secure peer-to-peer video rooms, chat, and file sharing with zero signup. Connect. Communicate. Share." />
   <link rel="icon" type="image/png" href="favicon.png">
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body class="page-home">
-  <!-- Topbar -->
-  <div class="status-bar">
-    <div class="brand">LinkDrop</div>
-    <button class="ghost" onclick="openAbout()">About</button>
-  </div>
+  <!-- Silk Background & Overlay -->
+  <canvas id="silk-canvas"></canvas>
+  <div class="dark-overlay"></div>
 
-  <!-- Hero -->
-  <main class="container hero-wrap">
-    <div class="hero">
-      <h1 class="grad-text">Share instantly. Securely.</h1>
-      <p class="sub">With <b>LinkDrop</b>, creating private video rooms is effortless. Just drop a link, share it with friends, and connect instantly — simple, fast, and fun.</p>
-      <div class="buttons">
-        <button class="btn-primary" onclick="createRoomFlow()" aria-label="Create a new room">➕ Create Room</button>
-        <button class="btn" onclick="openJoin()" aria-label="Join an existing room">🔑 Join Room</button>
+  <div class="app-root">
+    <!-- Topbar -->
+    <div class="status-bar">
+      <div class="brand-wrap">
+        <a href="/" class="brand">Nexus</a>
       </div>
-      <p class="small">Tip: Press <b>C</b> to create, <b>J</b> to join</p>
+      <div class="top-actions">
+        <button class="icon-btn" onclick="openAbout()" aria-label="About Nexus">About</button>
+      </div>
     </div>
 
-    <!-- Features (4 cards) -->
-    <section class="features">
-      <article class="feature">
-        <div class="f-ico">🆓</div>
-        <h3>Free & Unlimited</h3>
-        <p>No hidden costs. Unlimited rooms, unlimited minutes.</p>
-      </article>
+    <!-- Hero Container -->
+    <main class="container hero-wrap">
+      <div class="hero">
+        <h1 class="grad-text">Connect.<br>Communicate. Share.</h1>
+        <p class="sub">Instant peer-to-peer video calls and file transfers directly between browsers. No accounts, no servers stored in between.</p>
+        <div class="buttons">
+          <button class="btn-primary" onclick="openCreateModal()" aria-label="Create a new room">Create Room</button>
+          <button class="btn" onclick="openJoin()" aria-label="Join an existing room">Join Room</button>
+        </div>
+        <p class="shortcut-tip">Press <b>C</b> to create a room, <b>J</b> to join</p>
+      </div>
 
-      <article class="feature">
-        <div class="f-ico">⚡</div>
-        <h3>Instant</h3>
-        <p>No signup. Create a code, share, and connect.</p>
-      </article>
+      <!-- Feature Cards -->
+      <section class="features">
+        <article class="feature">
+          <div class="f-ico">⚡</div>
+          <h3>Free & Unlimited</h3>
+          <p>Unlimited rooms and call minutes without any hidden costs or restrictions.</p>
+        </article>
 
-      <article class="feature">
-        <div class="f-ico">🔒</div>
-        <h3>End-to-End Privacy</h3>
-        <p>Peer-to-peer calls — your media never touches our servers.</p>
-      </article>
+        <article class="feature">
+          <div class="f-ico">🚀</div>
+          <h3>Instant</h3>
+          <p>Create a 6-character room code, share the link, and connect instantly.</p>
+        </article>
 
-      <article class="feature">
-        <div class="f-ico">🚫</div>
-        <h3>No Tracking & History</h3>
-        <p>No tracking, no call history, no analytics cookies. Period.</p>
-      </article>
-    </section>
-  </main>
+        <article class="feature">
+          <div class="f-ico">🔒</div>
+          <h3>Peer-to-Peer Media</h3>
+          <p>Video and audio are exchanged directly between participants whenever the WebRTC connection permits.</p>
+        </article>
+
+        <article class="feature">
+          <div class="f-ico">👤</div>
+          <h3>No Account Required</h3>
+          <p>Join a room without creating an account or providing personal details.</p>
+        </article>
+      </section>
+    </main>
+  </div>
 
   <!-- Join Modal -->
   <div id="joinModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="joinTitle">
     <div class="modal-content">
       <h2 id="joinTitle">Join a Room</h2>
-      <div class="field">
+      <div class="form-group">
+        <label for="joinCode">Room Code</label>
         <input id="joinCode" type="text" inputmode="latin-prose" maxlength="6"
                placeholder="Enter 6-char code (e.g. A1B2C3)" aria-label="Room code">
       </div>
       <div class="modal-buttons">
-        <button onclick="closeJoin()">Cancel</button>
-        <button class="primary" onclick="submitJoin()">Join</button>
+        <button class="ghost-btn" onclick="closeJoin()">Cancel</button>
+        <button class="btn-primary" onclick="submitJoin()">Join Room</button>
       </div>
-      <div class="small">Only A–Z and 0–9 are allowed.</div>
+      <div class="shortcut-tip">Only A–Z and 0–9 are allowed.</div>
     </div>
   </div>
 
@@ -76,110 +87,95 @@
   <div id="createdModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="createdTitle">
     <div class="modal-content">
       <h2 id="createdTitle">Room Created</h2>
-      <div class="small">Share this code or link with your peer</div>
+      <p class="shortcut-tip">Share this code or link with your peer to join</p>
 
-      <div class="code" id="createdCode">••••••</div>
+      <div class="code-box" id="createdCode">••••••</div>
 
-      <div class="field">
-        <input id="createdLink" type="text" readonly>
+      <div class="form-group">
+        <input id="createdLink" type="text" readonly aria-label="Room Shareable Link">
       </div>
 
       <div class="modal-buttons">
-        <button onclick="copyCreatedLink()">Copy Link</button>
-        <button onclick="shareCreatedLink()">Share</button>
-        <button class="primary" onclick="enterCreatedRoom()">Enter Room</button>
+        <button class="ghost-btn" onclick="copyCreatedLink()">Copy Link</button>
+        <button class="ghost-btn" onclick="shareCreatedLink()">Share</button>
+        <button class="btn-primary" onclick="enterCreatedRoom()">Enter Room</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- About Modal -->
+  <div id="aboutModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="aboutTitle">
+    <div class="modal-content">
+      <h2 id="aboutTitle">About Nexus</h2>
+      <p style="color: var(--muted); font-size: 13.5px; line-height: 1.6;">
+        Nexus is a lightweight, zero-trust peer-to-peer web application designed for fast video communications and direct file sharing.  
+        Media and files travel directly between web browsers over WebRTC.
+      </p>
+      <div class="modal-buttons">
+        <button class="btn-primary" onclick="closeAbout()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Room Options Modal -->
+  <div id="createRoomModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="createTitle">
+    <div class="modal-content">
+      <h2 id="createTitle">Create a Room</h2>
+
+      <div class="form-group">
+        <label>Room Security</label>
+        <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px;">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text); font-size: 13px;">
+            <input type="radio" name="roomPinOption" value="none" checked onchange="togglePinInput(false)" style="accent-color: var(--accent);">
+            <span>No Password</span>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text); font-size: 13px;">
+            <input type="radio" name="roomPinOption" value="pin" onchange="togglePinInput(true)" style="accent-color: var(--accent);">
+            <span>PIN Protected</span>
+          </label>
+        </div>
       </div>
 
-      <div class="small">You can always share the link after entering, too.</div>
+      <div id="createPinWrap" class="form-group" style="display: none;">
+        <label for="createPinInput">Room PIN (Numeric)</label>
+        <input id="createPinInput" type="password" inputmode="numeric" maxlength="6" placeholder="Enter PIN (e.g. 4829)" aria-label="Room PIN">
+      </div>
+
+      <div class="modal-buttons">
+        <button class="ghost-btn" onclick="closeCreateModal()">Cancel</button>
+        <button class="btn-primary" onclick="submitCreateRoom()">Create Room</button>
+      </div>
     </div>
   </div>
 
- <!-- About Modal -->
-<div id="aboutModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="aboutTitle">
-  <div class="modal-content">
-    <h2 id="aboutTitle">About</h2>
-    <p>
-      LinkDrop lets you create and join video rooms instantly.  
-      No accounts, no tracking — just share a code and connect securely with anyone.
-    </p>
-    <div class="modal-buttons">
-      <button class="primary" onclick="closeAbout()">Close</button>
-    </div>
-  </div>
-</div>
-
-
-  <!-- Landing-only JS -->
+  <!-- Scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="/silk.js"></script>
+  <script src="/script.js"></script>
   <script>
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
+      if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
       const k = e.key.toLowerCase();
-      if (k === 'c') createRoomFlow();
+      if (k === 'c') openCreateModal();
       if (k === 'j') openJoin();
     });
 
-    // Helpers
-    function randomCode(){ return Math.random().toString(36).substr(2,6).toUpperCase(); }
-    function roomUrl(code){ return `${location.origin}/room/${code}`; }
-
-    // Join flow
+    // Join Flow
     const joinModal = document.getElementById('joinModal');
     const joinInput = document.getElementById('joinCode');
-    function openJoin(){ joinModal.style.display='flex'; setTimeout(()=>joinInput.focus(),0); }
-    function closeJoin(){ joinModal.style.display='none'; }
-    function submitJoin(){
-      const code = (joinInput.value||'').trim().toUpperCase();
-      if(/^[A-Z0-9]{6}$/.test(code)) location.href = `/room/${code}`;
-      else { joinInput.value=''; joinInput.placeholder='Invalid code — try A1B2C3'; }
+    function openJoin() { joinModal.classList.add('open'); setTimeout(() => joinInput?.focus(), 50); }
+    function closeJoin() { joinModal.classList.remove('open'); }
+    function submitJoin() {
+      const code = (joinInput.value || '').trim().toUpperCase();
+      if (/^[A-Z0-9]{6}$/.test(code)) location.href = `/room/${code}`;
+      else { joinInput.value = ''; joinInput.placeholder = 'Invalid code — enter 6 characters'; }
     }
 
-    // Created room flow
-    let lastCreatedCode = null;
-    const createdModal = document.getElementById('createdModal');
-    const createdCodeEl = document.getElementById('createdCode');
-    const createdLinkEl = document.getElementById('createdLink');
-
-    function createRoomFlow(){
-      lastCreatedCode = randomCode();
-      const link = roomUrl(lastCreatedCode);
-      createdCodeEl.textContent = lastCreatedCode;
-      createdLinkEl.value = link;
-      createdModal.style.display = 'flex';
-      setTimeout(()=> createdLinkEl.select(), 0);
-    }
-
-    async function shareCreatedLink(){
-      const link = createdLinkEl.value;
-      try{
-        if (navigator.share) {
-          await navigator.share({ title: 'LinkDrop Room', text: `Join my room: ${lastCreatedCode}`, url: link });
-        } else {
-          await navigator.clipboard.writeText(link);
-          alert('Link copied to clipboard');
-        }
-      }catch(e){ /* ignore cancel */ }
-    }
-
-    async function copyCreatedLink(){
-      try{
-        await navigator.clipboard.writeText(createdLinkEl.value);
-        alert('Link copied to clipboard');
-      }catch(e){
-        createdLinkEl.select();
-        document.execCommand('copy');
-        alert('Link copied (fallback)');
-      }
-    }
-
-    function enterCreatedRoom(){
-      if (!lastCreatedCode) return;
-      location.href = `/room/${lastCreatedCode}`;
-    }
-
-    // About
+    // About Modal
     const aboutModal = document.getElementById('aboutModal');
-    function openAbout(){ aboutModal.style.display='flex'; }
-    function closeAbout(){ aboutModal.style.display='none'; }
+    function openAbout() { aboutModal.classList.add('open'); }
+    function closeAbout() { aboutModal.classList.remove('open'); }
   </script>
 </body>
 </html>

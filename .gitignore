@@ -1,0 +1,21 @@
+# Dependencies
+node_modules
+node_modules/
+package-lock.json
+
+# Environment Secrets
+.env
+.env.*
+!.env.example
+
+# Server Logs & Temp Files
+logs
+logs/
+*.log
+scratch/
+.tempmediaStorage/
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
