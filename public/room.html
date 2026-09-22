@@ -32,15 +32,15 @@
     </div>
 
     <!-- Main Video Stage -->
-    <main class="room-stage">
-      <div class="video-container">
+    <main class="room-stage" id="roomStage">
+      <div class="video-container" id="videoContainer">
         <!-- Screen Share Banner -->
         <div id="screenShareBanner" class="screen-share-banner" style="display: none;">
           🖥️ <span id="screenShareText">Screen Share Active</span>
         </div>
 
         <!-- Remote Main Video -->
-        <div class="remote-video-wrap" id="remoteVideoWrap">
+        <div class="remote-video-wrap video-primary" id="remoteVideoWrap" role="region" aria-label="Remote video stream">
           <video id="remoteVideo" autoplay playsinline></video>
           <div id="remoteAvatar" class="avatar-placeholder">
             <div class="avatar-icon">P</div>
@@ -49,7 +49,7 @@
         </div>
 
         <!-- Floating Local PiP Video -->
-        <div class="local-video-wrap mirror" id="localVideoWrap">
+        <div class="local-video-wrap mirror video-mini draggable-preview" id="localVideoWrap" role="button" tabindex="0" aria-label="Tap to swap camera view, drag to move preview">
           <video id="localVideo" autoplay playsinline muted></video>
           <div id="localAvatar" class="avatar-placeholder">
             <div class="avatar-icon">YOU</div>

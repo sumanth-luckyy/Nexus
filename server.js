@@ -8,6 +8,8 @@ const crypto = require('crypto');
 const app = express();
 const server = http.createServer(app);
 
+app.use(express.json());
+
 // Security Headers Middleware
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -21,15 +23,22 @@ app.use((req, res, next) => {
   next();
 });
 
-// Dynamic ICE Servers Endpoint (supports TURN environment variables safely)
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// Dynamic ICE Servers Endpoint (supports STUN_SERVER & TURN environment variables safely)
 app.get('/api/ice-servers', (req, res) => {
+  const stunServer = process.env.STUN_SERVER || 'stun:stun.l.google.com:19302';
   const iceServers = [
-    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: stunServer },
     { urls: 'stun:stun1.l.google.com:19302' }
   ];
 
-  if (process.env.TURN_URL) {
-    const turnUrls = process.env.TURN_URL.split(',').map(u => u.trim()).filter(Boolean);
+  const turnUrl = process.env.TURN_SERVER || process.env.TURN_URL;
+  if (turnUrl) {
+    const turnUrls = turnUrl.split(',').map(u => u.trim()).filter(Boolean);
     for (const url of turnUrls) {
       const turnConfig = { urls: url };
       if (process.env.TURN_USERNAME) turnConfig.username = process.env.TURN_USERNAME;
@@ -45,17 +54,33 @@ app.get('/api/ice-servers', (req, res) => {
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Configure Socket.IO with CORS
+const frontendOrigin = process.env.FRONTEND_ORIGIN || "*";
 const io = socketIo(server, {
   cors: {
-    origin: "*",
+    origin: frontendOrigin,
     methods: ["GET", "POST"],
     credentials: true
   },
+  transports: ["websocket", "polling"],
   pingTimeout: 60000,
   pingInterval: 25000
 });
 
-// In-memory room tracking: { [code]: { hostId: string, guestId?: string, pendingId?: string, createdAt: number, lastActive: number, pinHash?: string } }
+/**
+ * Strict 1-to-1 Room Store
+ * rooms[code] = {
+ *   hostId: string,
+ *   guestId: string | null,
+ *   pendingGuestId: string | null,
+ *   status: 'waiting' | 'pending' | 'connected' | 'closed',
+ *   hostDisplayName: string,
+ *   guestDisplayName: string | null,
+ *   pendingDisplayName: string | null,
+ *   pinHash: string | null,
+ *   createdAt: number,
+ *   lastActive: number
+ * }
+ */
 const rooms = {};
 
 // In-memory rate limiters
@@ -108,8 +133,8 @@ function checkSignalingRateLimit(socketId) {
     record.resetAt = now + 10 * 1000;
   }
 
-  if (record.count >= 60) {
-    return false; // Rate limited (max 60 signaling events per 10s)
+  if (record.count >= 100) {
+    return false; // Rate limited (max 100 signaling events per 10s)
   }
 
   record.count++;
@@ -117,9 +142,29 @@ function checkSignalingRateLimit(socketId) {
   return true;
 }
 
-// Input validation helpers
+// Input validation & Cryptographically secure room code generation helpers
 function isValidRoomCode(code) {
   return typeof code === 'string' && /^[A-Z0-9]{6}$/.test(code.trim().toUpperCase());
+}
+
+function generateSecureRoomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(6);
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[bytes[i] % chars.length];
+  }
+  return code;
+}
+
+function generateUniqueRoomCode() {
+  let attempts = 0;
+  while (attempts < 100) {
+    const code = generateSecureRoomCode();
+    if (!rooms[code]) return code;
+    attempts++;
+  }
+  throw new Error("Unable to generate unique room code");
 }
 
 function sanitizeString(val, maxLen = 64) {
@@ -133,12 +178,35 @@ function touchRoom(room) {
   }
 }
 
-// Helper for socket membership check
-function isSocketInRoom(socket, roomCode) {
-  return socket.rooms && socket.rooms.has(roomCode);
+function getRoomPair(room) {
+  if (!room) return [];
+  const pair = [];
+  if (room.hostId) pair.push(room.hostId);
+  if (room.guestId) pair.push(room.guestId);
+  return pair;
+}
+
+function isAuthorizedPeerPair(room, socketId1, socketId2) {
+  if (!room || !socketId1 || !socketId2) return false;
+  const isHostGuest = (room.hostId === socketId1 && room.guestId === socketId2) ||
+                      (room.hostId === socketId2 && room.guestId === socketId1);
+  return isHostGuest;
 }
 
 // Express routes
+app.post('/api/create-room-code', (req, res) => {
+  const clientIp = req.ip || req.connection.remoteAddress;
+  if (!checkRoomCreateLimit(clientIp)) {
+    return res.status(429).json({ error: "Too many room creations. Please try again later." });
+  }
+  try {
+    const code = generateUniqueRoomCode();
+    res.json({ code });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to generate room code" });
+  }
+});
+
 app.get('/room/:code', (req, res) => {
   const code = sanitizeString(req.params.code, 6).toUpperCase();
   if (!isValidRoomCode(code)) {
@@ -161,29 +229,33 @@ app.use((err, req, res, next) => {
 io.on("connection", (socket) => {
   const clientIp = socket.handshake.address || socket.id;
 
-  // Check if room exists and whether it is PIN protected (Without exposing PIN)
+  // Check if room exists and whether it is PIN protected
   socket.on("check-room", ({ roomId }, callback) => {
     if (typeof callback !== 'function') return;
     if (!roomId || typeof roomId !== 'string') {
-      return callback({ exists: false, protected: false });
+      return callback({ exists: false, protected: false, status: 'closed' });
     }
     const cleanCode = sanitizeString(roomId, 6).toUpperCase();
     if (!isValidRoomCode(cleanCode)) {
-      return callback({ exists: false, protected: false });
+      return callback({ exists: false, protected: false, status: 'closed' });
     }
 
     const room = rooms[cleanCode];
-    if (!room) {
-      return callback({ exists: false, protected: false });
+    if (!room || room.status === 'closed') {
+      return callback({ exists: false, protected: false, status: 'closed' });
     }
 
     touchRoom(room);
-    const memberCount = room.members ? Object.keys(room.members).length : (room.guestId ? 2 : 1);
+    const memberCount = (room.hostId ? 1 : 0) + (room.guestId ? 1 : 0);
+    const isFull = memberCount >= 2 || (room.pendingGuestId && room.pendingGuestId !== socket.id);
+
     callback({
       exists: true,
       protected: !!room.pinHash,
-      maxMembers: room.maxMembers || 2,
-      currentMembers: memberCount
+      status: room.status,
+      maxMembers: 2,
+      currentMembers: memberCount,
+      isFull
     });
   });
 
@@ -206,7 +278,7 @@ io.on("connection", (socket) => {
     }
 
     const room = rooms[cleanCode];
-    if (!room) {
+    if (!room || room.status === 'closed') {
       return callback({ success: false, error: "ROOM_NOT_FOUND" });
     }
 
@@ -235,7 +307,7 @@ io.on("connection", (socket) => {
     callback({ success: true });
   });
 
-  // Join / Create Room with optional PIN, maxMembers, and displayName
+  // Join / Create Room (Strict 1-to-1)
   socket.on("join-room", (roomCode, userId, pin, maxMembersInput, displayNameInput) => {
     if (!roomCode || typeof roomCode !== 'string') return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
@@ -244,24 +316,23 @@ io.on("connection", (socket) => {
     const displayName = sanitizeString(displayNameInput, 32) || 'User';
 
     if (!rooms[cleanCode]) {
-      // Creation Rate Limit Check
+      // Room creation
       if (!checkRoomCreateLimit(clientIp)) {
         socket.emit("error-message", "Too many rooms created. Please try again later.");
         return;
       }
 
-      // Host creates room
       const now = Date.now();
-      const maxMem = Math.min(10, Math.max(2, parseInt(maxMembersInput) || 2));
       const roomData = {
         hostId: socket.id,
+        guestId: null,
+        pendingGuestId: null,
+        status: 'waiting',
+        hostDisplayName: displayName,
+        guestDisplayName: null,
+        pendingDisplayName: null,
         createdAt: now,
-        lastActive: now,
-        maxMembers: maxMem,
-        members: {
-          [socket.id]: { socketId: socket.id, displayName, isHost: true }
-        },
-        pendingGuests: {}
+        lastActive: now
       };
 
       if (pin && typeof pin === 'string' && pin.trim().length > 0) {
@@ -271,40 +342,62 @@ io.on("connection", (socket) => {
 
       rooms[cleanCode] = roomData;
       socket.join(cleanCode);
-      console.log(`👑 Host created room: ${cleanCode} (Max: ${maxMem}) ${roomData.pinHash ? '[PIN Protected]' : ''}`);
+      console.log(`👑 Host created 1-to-1 room: ${cleanCode} ${roomData.pinHash ? '[PIN Protected]' : ''}`);
 
       socket.emit("room-joined", {
         isHost: true,
-        maxMembers: maxMem,
-        members: Object.values(roomData.members)
+        role: 'host',
+        maxMembers: 2,
+        members: [{ socketId: socket.id, displayName, isHost: true }]
       });
     } else {
       // Room exists
       const room = rooms[cleanCode];
       touchRoom(room);
 
-      if (!room.members) room.members = {};
-      if (!room.pendingGuests) room.pendingGuests = {};
-      if (!room.maxMembers) room.maxMembers = 2;
-
-      const isHost = socket.id === room.hostId || (room.members[socket.id] && room.members[socket.id].isHost);
-      const isMember = !!room.members[socket.id];
-      const isPending = !!room.pendingGuests[socket.id];
-
-      // Server-Side Capacity Check
-      const memberCount = Object.keys(room.members).length;
-      const pendingCount = Object.keys(room.pendingGuests).length;
-
-      if (!isHost && !isMember && !isPending) {
-        if (memberCount + pendingCount >= room.maxMembers) {
-          console.log(`⚠️ Room ${cleanCode} is full (${memberCount}/${room.maxMembers}). Rejecting ${socket.id}`);
-          socket.emit("room-full");
-          return;
+      if (socket.id === room.hostId) {
+        // Host rejoining
+        room.hostDisplayName = displayName;
+        socket.join(cleanCode);
+        const members = [{ socketId: socket.id, displayName, isHost: true }];
+        if (room.guestId) {
+          members.push({ socketId: room.guestId, displayName: room.guestDisplayName || 'Guest', isHost: false });
         }
+        socket.emit("room-joined", {
+          isHost: true,
+          role: 'host',
+          maxMembers: 2,
+          members
+        });
+        return;
+      }
+
+      if (socket.id === room.guestId) {
+        // Guest rejoining
+        room.guestDisplayName = displayName;
+        socket.join(cleanCode);
+        const members = [
+          { socketId: room.hostId, displayName: room.hostDisplayName || 'Host', isHost: true },
+          { socketId: socket.id, displayName, isHost: false }
+        ];
+        socket.emit("room-joined", {
+          isHost: false,
+          role: 'guest',
+          maxMembers: 2,
+          members
+        });
+        return;
+      }
+
+      // Check if room already has guest or pending guest
+      if (room.guestId || (room.pendingGuestId && room.pendingGuestId !== socket.id)) {
+        console.log(`⚠️ Room ${cleanCode} is full (Strict 1-to-1). Rejecting third user ${socket.id}`);
+        socket.emit("room-full");
+        return;
       }
 
       // Security check: Guest must be validated if PIN is set
-      if (room.pinHash && !isHost && !isMember) {
+      if (room.pinHash) {
         const isValidated = socket.validatedRooms && socket.validatedRooms.has(cleanCode);
         const cleanPin = pin ? sanitizeString(String(pin), 32) : '';
         const isPinMatch = cleanPin && crypto.createHash('sha256').update(cleanPin).digest('hex') === room.pinHash;
@@ -321,23 +414,16 @@ io.on("connection", (socket) => {
         }
       }
 
-      if (isHost || isMember) {
-        // Rejoining room
-        room.members[socket.id] = { socketId: socket.id, displayName, isHost: socket.id === room.hostId };
-        socket.join(cleanCode);
-        socket.emit("room-joined", {
-          isHost: socket.id === room.hostId,
-          maxMembers: room.maxMembers,
-          members: Object.values(room.members)
-        });
-      } else {
-        // Pending Guest joining
-        room.pendingGuests[socket.id] = { socketId: socket.id, displayName };
-        socket.join(cleanCode);
-        console.log(`👤 Guest (${displayName}) pending in room ${cleanCode}`);
+      // Guest requesting entry (Pending status)
+      room.pendingGuestId = socket.id;
+      room.pendingDisplayName = displayName;
+      room.status = 'pending';
+      socket.join(cleanCode);
 
-        io.to(room.hostId).emit("request-join", { socketId: socket.id, displayName });
-      }
+      console.log(`👤 Guest (${displayName} / ${socket.id}) requesting entry in room ${cleanCode}`);
+
+      // Forward join request to host
+      io.to(room.hostId).emit("request-join", { socketId: socket.id, displayName });
     }
   });
 
@@ -348,38 +434,39 @@ io.on("connection", (socket) => {
     if (!isValidRoomCode(cleanCode)) return;
 
     const room = rooms[cleanCode];
-    if (!room || room.hostId !== socket.id) return;
+    if (!room || room.hostId !== socket.id) return; // Strict Host validation
 
     touchRoom(room);
 
-    let guestId = targetSocketId;
-    if (!guestId && room.pendingGuests) {
-      guestId = Object.keys(room.pendingGuests)[0];
-    } else if (!guestId && room.pendingId) {
-      guestId = room.pendingId;
-    }
+    const guestId = targetSocketId || room.pendingGuestId;
+    if (!guestId || (room.pendingGuestId && room.pendingGuestId !== guestId)) return;
 
-    if (!guestId) return;
-
-    const guestInfo = (room.pendingGuests && room.pendingGuests[guestId]) || { socketId: guestId, displayName: 'Guest' };
-    if (room.pendingGuests) delete room.pendingGuests[guestId];
-    delete room.pendingId;
-
-    if (!room.members) room.members = {};
-    room.members[guestId] = { socketId: guestId, displayName: guestInfo.displayName, isHost: false };
     room.guestId = guestId;
+    room.guestDisplayName = room.pendingDisplayName || 'Guest';
+    room.pendingGuestId = null;
+    room.pendingDisplayName = null;
+    room.status = 'connected';
 
-    const allMembers = Object.values(room.members);
+    const members = [
+      { socketId: room.hostId, displayName: room.hostDisplayName, isHost: true },
+      { socketId: room.guestId, displayName: room.guestDisplayName, isHost: false }
+    ];
 
+    console.log(`🤝 Host ${socket.id} accepted Guest ${guestId} in room ${cleanCode}`);
+
+    // Notify Guest of acceptance
     io.to(guestId).emit("accepted", {
-      members: allMembers,
-      maxMembers: room.maxMembers
+      members,
+      maxMembers: 2,
+      hostId: room.hostId,
+      hostDisplayName: room.hostDisplayName
     });
 
-    socket.broadcast.to(cleanCode).emit("user-joined", {
+    // Notify Host that user joined
+    socket.emit("user-joined", {
       socketId: guestId,
-      displayName: guestInfo.displayName,
-      members: allMembers
+      displayName: room.guestDisplayName,
+      members
     });
   });
 
@@ -393,15 +480,19 @@ io.on("connection", (socket) => {
     if (!room || room.hostId !== socket.id) return;
 
     touchRoom(room);
-    let guestId = targetSocketId || (room.pendingGuests && Object.keys(room.pendingGuests)[0]) || room.pendingId;
+    const guestId = targetSocketId || room.pendingGuestId;
     if (guestId) {
+      console.log(`🚫 Host ${socket.id} rejected Guest ${guestId} in room ${cleanCode}`);
       io.to(guestId).emit("rejected");
-      if (room.pendingGuests) delete room.pendingGuests[guestId];
-      delete room.pendingId;
+      if (room.pendingGuestId === guestId) {
+        room.pendingGuestId = null;
+        room.pendingDisplayName = null;
+        room.status = 'waiting';
+      }
     }
   });
 
-  // WebRTC Signaling Forwarding (Targeted or Broadcast fallback)
+  // Targeted & Validated WebRTC Signaling
   socket.on("offer", (roomCode, offer, targetSocketId) => {
     if (!roomCode || typeof roomCode !== 'string' || !offer || typeof offer !== 'object') return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
@@ -409,15 +500,17 @@ io.on("connection", (socket) => {
     if (!checkSignalingRateLimit(socket.id)) return;
 
     const room = rooms[cleanCode];
-    if (room && isSocketInRoom(socket, cleanCode)) {
-      touchRoom(room);
-      const senderName = room.members && room.members[socket.id] ? room.members[socket.id].displayName : 'Peer';
-      if (targetSocketId && typeof targetSocketId === 'string') {
-        io.to(targetSocketId).emit("offer", { offer, senderId: socket.id, senderName });
-      } else {
-        socket.broadcast.to(cleanCode).emit("offer", offer, socket.id);
-      }
+    if (!room) return;
+
+    // Strict validation: must be room's host or guest, and target must be the counter-peer
+    const targetId = targetSocketId || (socket.id === room.hostId ? room.guestId : room.hostId);
+    if (!targetId || !isAuthorizedPeerPair(room, socket.id, targetId)) {
+      return;
     }
+
+    touchRoom(room);
+    const senderName = socket.id === room.hostId ? room.hostDisplayName : room.guestDisplayName;
+    io.to(targetId).emit("offer", { offer, senderId: socket.id, senderName });
   });
 
   socket.on("answer", (roomCode, answer, targetSocketId) => {
@@ -427,14 +520,15 @@ io.on("connection", (socket) => {
     if (!checkSignalingRateLimit(socket.id)) return;
 
     const room = rooms[cleanCode];
-    if (room && isSocketInRoom(socket, cleanCode)) {
-      touchRoom(room);
-      if (targetSocketId && typeof targetSocketId === 'string') {
-        io.to(targetSocketId).emit("answer", { answer, senderId: socket.id });
-      } else {
-        socket.broadcast.to(cleanCode).emit("answer", answer, socket.id);
-      }
+    if (!room) return;
+
+    const targetId = targetSocketId || (socket.id === room.hostId ? room.guestId : room.hostId);
+    if (!targetId || !isAuthorizedPeerPair(room, socket.id, targetId)) {
+      return;
     }
+
+    touchRoom(room);
+    io.to(targetId).emit("answer", { answer, senderId: socket.id });
   });
 
   socket.on("ice-candidate", (roomCode, candidate, targetSocketId) => {
@@ -444,46 +538,52 @@ io.on("connection", (socket) => {
     if (!checkSignalingRateLimit(socket.id)) return;
 
     const room = rooms[cleanCode];
-    if (room && isSocketInRoom(socket, cleanCode)) {
-      touchRoom(room);
-      if (targetSocketId && typeof targetSocketId === 'string') {
-        io.to(targetSocketId).emit("ice-candidate", { candidate, senderId: socket.id });
-      } else {
-        socket.broadcast.to(cleanCode).emit("ice-candidate", candidate, socket.id);
-      }
+    if (!room) return;
+
+    const targetId = targetSocketId || (socket.id === room.hostId ? room.guestId : room.hostId);
+    if (!targetId || !isAuthorizedPeerPair(room, socket.id, targetId)) {
+      return;
     }
+
+    touchRoom(room);
+    io.to(targetId).emit("ice-candidate", { candidate, senderId: socket.id });
   });
 
-  // Media state signaling (mic, cam, screen share, display name)
+  // Media state signaling (mic, cam, screen share)
   socket.on("peer-state-change", (roomCode, state) => {
     if (!roomCode || typeof roomCode !== 'string' || !state || typeof state !== 'object') return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
     if (!isValidRoomCode(cleanCode)) return;
 
     const room = rooms[cleanCode];
-    if (room && isSocketInRoom(socket, cleanCode)) {
+    if (!room) return;
+
+    const targetId = socket.id === room.hostId ? room.guestId : room.hostId;
+    if (targetId) {
       touchRoom(room);
-      socket.broadcast.to(cleanCode).emit("peer-state-change", {
+      io.to(targetId).emit("peer-state-change", {
         socketId: socket.id,
         ...state
       });
     }
   });
 
-  // Legacy Screen share state signaling
   socket.on("screen-share-state", (roomCode, isSharing) => {
     if (!roomCode || typeof roomCode !== 'string') return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
     if (!isValidRoomCode(cleanCode)) return;
 
     const room = rooms[cleanCode];
-    if (room && isSocketInRoom(socket, cleanCode)) {
+    if (!room) return;
+
+    const targetId = socket.id === room.hostId ? room.guestId : room.hostId;
+    if (targetId) {
       touchRoom(room);
-      socket.broadcast.to(cleanCode).emit("screen-share-state", !!isSharing);
+      io.to(targetId).emit("screen-share-state", !!isSharing);
     }
   });
 
-  // Disconnect & Leave Cleanup
+  // Disconnect Cleanup
   socket.on("disconnect", () => {
     delete pinAttemptLimits[socket.id];
     delete signalingLimits[socket.id];
@@ -491,41 +591,31 @@ io.on("connection", (socket) => {
     for (const code in rooms) {
       const room = rooms[code];
 
-      if (room.pendingGuests && room.pendingGuests[socket.id]) {
-        delete room.pendingGuests[socket.id];
+      // Case 1: Pending guest canceled / disconnected
+      if (room.pendingGuestId === socket.id) {
+        room.pendingGuestId = null;
+        room.pendingDisplayName = null;
+        room.status = room.guestId ? 'connected' : 'waiting';
         io.to(room.hostId).emit("guest-canceled", { socketId: socket.id });
       }
-      if (room.pendingId === socket.id) {
-        delete room.pendingId;
-        io.to(room.hostId).emit("guest-canceled", { socketId: socket.id });
-      }
 
-      if (room.members && room.members[socket.id]) {
-        delete room.members[socket.id];
-
-        // Broadcast to remaining room members that user left
-        io.to(code).emit("user-left", { socketId: socket.id });
-        io.to(code).emit("peer-disconnected", { socketId: socket.id });
-
-        const remainingMembers = Object.values(room.members);
-
-        if (remainingMembers.length === 0) {
-          console.log(`🧹 Room ${code} empty after disconnect, removing.`);
-          delete rooms[code];
-        } else if (room.hostId === socket.id) {
-          // Transfer Host Role to the next connected participant!
-          const newHost = remainingMembers[0];
-          room.hostId = newHost.socketId;
-          newHost.isHost = true;
-          console.log(`👑 Host left room ${code}. Transferred host role to ${newHost.displayName} (${newHost.socketId})`);
-          io.to(code).emit("host-changed", {
-            newHostId: newHost.socketId,
-            newHostName: newHost.displayName,
-            members: remainingMembers
-          });
+      // Case 2: Host disconnected
+      if (room.hostId === socket.id) {
+        console.log(`🧹 Host disconnected from room ${code}`);
+        if (room.guestId) {
+          io.to(room.guestId).emit("peer-disconnected", { socketId: socket.id, role: 'host' });
+          io.to(room.guestId).emit("user-left", { socketId: socket.id });
         }
-      } else if (room.hostId === socket.id && (!room.members || Object.keys(room.members).length === 0)) {
         delete rooms[code];
+      }
+      // Case 3: Guest disconnected
+      else if (room.guestId === socket.id) {
+        console.log(`🧹 Guest disconnected from room ${code}`);
+        room.guestId = null;
+        room.guestDisplayName = null;
+        room.status = 'waiting';
+        io.to(room.hostId).emit("peer-disconnected", { socketId: socket.id, role: 'guest' });
+        io.to(room.hostId).emit("user-left", { socketId: socket.id });
       }
     }
   });
@@ -558,8 +648,26 @@ server.on('error', (err) => {
   }
 });
 
-// Start server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`✅ Signaling server running on port ${PORT}`);
+// Start server with automatic fallback if default port is in use
+let PORT = process.env.PORT || 3000;
+
+function listen(port) {
+  server.listen(port, () => {
+    console.log(`✅ Nexus 1-to-1 WebRTC Signaling server running on http://localhost:${port}`);
+  });
+}
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE' && !process.env.PORT) {
+    console.warn(`⚠️ Port ${PORT} is in use, trying port ${PORT + 1}...`);
+    PORT++;
+    listen(PORT);
+  } else if (err.code === 'EADDRINUSE') {
+    console.error(`⚠️ Port ${PORT} is already in use.`);
+  } else {
+    console.error('Server error:', err.message);
+  }
 });
+
+listen(PORT);
+
