@@ -1,8 +1,10 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const socketIo = require('socket.io');
 const path = require('path');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 
 // Initialize Express app
 const app = express();
@@ -18,7 +20,7 @@ app.use((req, res, next) => {
   res.setHeader("Permissions-Policy", "camera=(self), microphone=(self), display-capture=(self)");
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.socket.io; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss: stun: turn: https://cdn.socket.io; frame-ancestors 'none';"
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.socket.io; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; media-src 'self' blob: http: https:; connect-src 'self' ws: wss: stun: turn: https: http: https://cdn.socket.io; frame-ancestors 'none';"
   );
   next();
 });
@@ -50,6 +52,165 @@ app.get('/api/ice-servers', (req, res) => {
   res.json({ iceServers });
 });
 
+// Helper to inspect HTTP/HTTPS media response headers without downloading file
+function inspectRemoteMediaHeaders(targetUrl, redirectCount = 0) {
+  return new Promise((resolve) => {
+    if (redirectCount > 5) {
+      return resolve({ success: false, error: 'Too many HTTP redirects.' });
+    }
+
+    try {
+      const parsedUrl = new URL(targetUrl);
+      const httpModule = parsedUrl.protocol === 'https:' ? https : http;
+
+      const reqOptions = {
+        method: 'HEAD',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Range': 'bytes=0-2048'
+        },
+        timeout: 8000
+      };
+
+      const req = httpModule.request(targetUrl, reqOptions, (res) => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          const redirectUrl = new URL(res.headers.location, targetUrl).toString();
+          return resolve(inspectRemoteMediaHeaders(redirectUrl, redirectCount + 1));
+        }
+
+        const statusCode = res.statusCode;
+        const contentType = res.headers['content-type'] || '';
+        const contentLength = res.headers['content-length'] ? parseInt(res.headers['content-length'], 10) : null;
+        const acceptRanges = res.headers['accept-ranges'] || '';
+        const contentRange = res.headers['content-range'] || '';
+
+        if (statusCode === 405 || (statusCode === 403 && redirectCount === 0)) {
+          const getReqOptions = {
+            method: 'GET',
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+              'Range': 'bytes=0-1024'
+            },
+            timeout: 8000
+          };
+          const getReq = httpModule.request(targetUrl, getReqOptions, (gRes) => {
+            const gStatus = gRes.statusCode;
+            const gType = gRes.headers['content-type'] || '';
+            const gLen = gRes.headers['content-length'] ? parseInt(gRes.headers['content-length'], 10) : null;
+            const gRanges = gRes.headers['accept-ranges'] || '';
+            gRes.destroy();
+
+            resolve({
+              success: gStatus >= 200 && gStatus < 400,
+              statusCode: gStatus,
+              contentType: gType,
+              contentLength: gLen,
+              acceptRanges: gRanges,
+              url: targetUrl
+            });
+          });
+          getReq.on('error', (err) => resolve({ success: false, error: err.message }));
+          getReq.end();
+          return;
+        }
+
+        res.destroy();
+
+        if (statusCode === 403 || statusCode === 410) {
+          return resolve({ success: false, statusCode, error: 'Stream URL expired. Please provide a new URL.' });
+        }
+        if (statusCode === 404) {
+          return resolve({ success: false, statusCode, error: 'Media stream not found (404). Please verify the URL.' });
+        }
+
+        resolve({
+          success: statusCode >= 200 && statusCode < 400,
+          statusCode,
+          contentType,
+          contentLength,
+          acceptRanges,
+          contentRange,
+          url: targetUrl
+        });
+      });
+
+      req.on('error', (err) => resolve({ success: false, error: err.message }));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ success: false, error: 'Network timeout connecting to media server.' });
+      });
+      req.end();
+    } catch (err) {
+      resolve({ success: false, error: 'Invalid URL format.' });
+    }
+  });
+}
+
+// Media Header Inspection Endpoint
+app.post('/api/detect-media', async (req, res) => {
+  const { url } = req.body || {};
+  if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url.trim())) {
+    return res.status(400).json({ success: false, error: 'Invalid HTTP/HTTPS media URL' });
+  }
+
+  try {
+    const result = await inspectRemoteMediaHeaders(url.trim());
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed to inspect media headers' });
+  }
+});
+
+// Progressive Server-Side Streaming Compatibility Pipeline
+app.get('/api/stream-pipeline', (req, res) => {
+  const mediaUrl = req.query.url;
+  if (!mediaUrl || typeof mediaUrl !== 'string' || !/^https?:\/\//i.test(mediaUrl.trim())) {
+    return res.status(400).json({ error: 'Invalid HTTP/HTTPS media URL' });
+  }
+
+  const cleanUrl = mediaUrl.trim();
+
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Connection', 'keep-alive');
+
+  const ffmpegArgs = [
+    '-re',
+    '-headers', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n',
+    '-i', cleanUrl,
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-tune', 'zerolatency',
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-f', 'mp4',
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    'pipe:1'
+  ];
+
+  let ffmpegProc = null;
+  try {
+    ffmpegProc = spawn('ffmpeg', ffmpegArgs);
+  } catch (err) {
+    return res.status(501).json({ error: 'FFmpeg compatibility pipeline is not available on server.' });
+  }
+
+  ffmpegProc.stdout.pipe(res);
+
+  ffmpegProc.on('error', (err) => {
+    console.warn('[Nexus Stream Pipeline] FFmpeg spawn error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Media compatibility processing error.' });
+    }
+  });
+
+  req.on('close', () => {
+    if (ffmpegProc) {
+      try { ffmpegProc.kill('SIGKILL'); } catch (e) {}
+    }
+  });
+});
+
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -67,16 +228,14 @@ const io = socketIo(server, {
 });
 
 /**
- * Strict 1-to-1 Room Store
+ * Multi-Participant Room Store
  * rooms[code] = {
  *   hostId: string,
- *   guestId: string | null,
- *   pendingGuestId: string | null,
- *   status: 'waiting' | 'pending' | 'connected' | 'closed',
- *   hostDisplayName: string,
- *   guestDisplayName: string | null,
- *   pendingDisplayName: string | null,
+ *   maxParticipants: number,
  *   pinHash: string | null,
+ *   status: 'waiting' | 'active' | 'closed',
+ *   participants: Map<socketId, { socketId: string, displayName: string, joinedAt: number, isHost: boolean }>,
+ *   pendingParticipants: Map<socketId, { socketId: string, displayName: string, requestedAt: number }>,
  *   createdAt: number,
  *   lastActive: number
  * }
@@ -178,19 +337,13 @@ function touchRoom(room) {
   }
 }
 
-function getRoomPair(room) {
-  if (!room) return [];
-  const pair = [];
-  if (room.hostId) pair.push(room.hostId);
-  if (room.guestId) pair.push(room.guestId);
-  return pair;
+function getRoomMembers(room) {
+  if (!room || !room.participants) return [];
+  return Array.from(room.participants.values());
 }
 
-function isAuthorizedPeerPair(room, socketId1, socketId2) {
-  if (!room || !socketId1 || !socketId2) return false;
-  const isHostGuest = (room.hostId === socketId1 && room.guestId === socketId2) ||
-                      (room.hostId === socketId2 && room.guestId === socketId1);
-  return isHostGuest;
+function isRoomMember(room, socketId) {
+  return !!(room && room.participants && room.participants.has(socketId));
 }
 
 // Express routes
@@ -246,14 +399,14 @@ io.on("connection", (socket) => {
     }
 
     touchRoom(room);
-    const memberCount = (room.hostId ? 1 : 0) + (room.guestId ? 1 : 0);
-    const isFull = memberCount >= 2 || (room.pendingGuestId && room.pendingGuestId !== socket.id);
+    const memberCount = room.participants.size;
+    const isFull = memberCount >= room.maxParticipants;
 
     callback({
       exists: true,
       protected: !!room.pinHash,
       status: room.status,
-      maxMembers: 2,
+      maxMembers: room.maxParticipants,
       currentMembers: memberCount,
       isFull
     });
@@ -307,7 +460,7 @@ io.on("connection", (socket) => {
     callback({ success: true });
   });
 
-  // Join / Create Room (Strict 1-to-1)
+  // Join / Create Multi-Participant Room
   socket.on("join-room", (roomCode, userId, pin, maxMembersInput, displayNameInput) => {
     if (!roomCode || typeof roomCode !== 'string') return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
@@ -322,15 +475,18 @@ io.on("connection", (socket) => {
         return;
       }
 
+      let parsedMax = parseInt(maxMembersInput, 10);
+      if (isNaN(parsedMax) || parsedMax < 2) parsedMax = 2;
+      if (parsedMax > 50) parsedMax = 50;
+
       const now = Date.now();
       const roomData = {
         hostId: socket.id,
-        guestId: null,
-        pendingGuestId: null,
+        maxParticipants: parsedMax,
+        pinHash: null,
         status: 'waiting',
-        hostDisplayName: displayName,
-        guestDisplayName: null,
-        pendingDisplayName: null,
+        participants: new Map(),
+        pendingParticipants: new Map(),
         createdAt: now,
         lastActive: now
       };
@@ -340,63 +496,60 @@ io.on("connection", (socket) => {
         roomData.pinHash = crypto.createHash('sha256').update(cleanPin).digest('hex');
       }
 
+      roomData.participants.set(socket.id, {
+        socketId: socket.id,
+        displayName,
+        joinedAt: now,
+        isHost: true
+      });
+
       rooms[cleanCode] = roomData;
       socket.join(cleanCode);
-      console.log(`👑 Host created 1-to-1 room: ${cleanCode} ${roomData.pinHash ? '[PIN Protected]' : ''}`);
+      console.log(`👑 Host created room: ${cleanCode} (Max: ${parsedMax}) ${roomData.pinHash ? '[PIN Protected]' : ''}`);
 
       socket.emit("room-joined", {
         isHost: true,
         role: 'host',
-        maxMembers: 2,
-        members: [{ socketId: socket.id, displayName, isHost: true }]
+        maxMembers: parsedMax,
+        members: getRoomMembers(roomData),
+        socketId: socket.id
       });
     } else {
       // Room exists
       const room = rooms[cleanCode];
       touchRoom(room);
 
-      if (socket.id === room.hostId) {
-        // Host rejoining
-        room.hostDisplayName = displayName;
+      // Rejoining participant
+      if (room.participants.has(socket.id)) {
+        const member = room.participants.get(socket.id);
+        member.displayName = displayName;
         socket.join(cleanCode);
-        const members = [{ socketId: socket.id, displayName, isHost: true }];
-        if (room.guestId) {
-          members.push({ socketId: room.guestId, displayName: room.guestDisplayName || 'Guest', isHost: false });
-        }
+
         socket.emit("room-joined", {
-          isHost: true,
-          role: 'host',
-          maxMembers: 2,
-          members
+          isHost: member.isHost,
+          role: member.isHost ? 'host' : 'participant',
+          maxMembers: room.maxParticipants,
+          members: getRoomMembers(room),
+          socketId: socket.id
         });
         return;
       }
 
-      if (socket.id === room.guestId) {
-        // Guest rejoining
-        room.guestDisplayName = displayName;
-        socket.join(cleanCode);
-        const members = [
-          { socketId: room.hostId, displayName: room.hostDisplayName || 'Host', isHost: true },
-          { socketId: socket.id, displayName, isHost: false }
-        ];
-        socket.emit("room-joined", {
-          isHost: false,
-          role: 'guest',
-          maxMembers: 2,
-          members
-        });
+      // Check if room is locked
+      if (room.isLocked) {
+        console.log(`🔒 Room ${cleanCode} is locked. Rejecting join-room from ${socket.id}`);
+        socket.emit("room-locked");
         return;
       }
 
-      // Check if room already has guest or pending guest
-      if (room.guestId || (room.pendingGuestId && room.pendingGuestId !== socket.id)) {
-        console.log(`⚠️ Room ${cleanCode} is full (Strict 1-to-1). Rejecting third user ${socket.id}`);
+      // Check capacity
+      if (room.participants.size >= room.maxParticipants) {
+        console.log(`⚠️ Room ${cleanCode} is full (${room.participants.size}/${room.maxParticipants}). Rejecting ${socket.id}`);
         socket.emit("room-full");
         return;
       }
 
-      // Security check: Guest must be validated if PIN is set
+      // Security check: Participant must be validated if PIN is set
       if (room.pinHash) {
         const isValidated = socket.validatedRooms && socket.validatedRooms.has(cleanCode);
         const cleanPin = pin ? sanitizeString(String(pin), 32) : '';
@@ -414,20 +567,22 @@ io.on("connection", (socket) => {
         }
       }
 
-      // Guest requesting entry (Pending status)
-      room.pendingGuestId = socket.id;
-      room.pendingDisplayName = displayName;
-      room.status = 'pending';
+      // Participant requesting entry (Pending status)
+      room.pendingParticipants.set(socket.id, {
+        socketId: socket.id,
+        displayName,
+        requestedAt: Date.now()
+      });
       socket.join(cleanCode);
 
-      console.log(`👤 Guest (${displayName} / ${socket.id}) requesting entry in room ${cleanCode}`);
+      console.log(`👤 Participant (${displayName} / ${socket.id}) requesting entry in room ${cleanCode}`);
 
-      // Forward join request to host
+      // Forward request to host
       io.to(room.hostId).emit("request-join", { socketId: socket.id, displayName });
     }
   });
 
-  // Host accepts guest
+  // Host accepts pending participant
   socket.on("accept", (roomCode, targetSocketId) => {
     if (!roomCode || typeof roomCode !== 'string') return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
@@ -438,39 +593,51 @@ io.on("connection", (socket) => {
 
     touchRoom(room);
 
-    const guestId = targetSocketId || room.pendingGuestId;
-    if (!guestId || (room.pendingGuestId && room.pendingGuestId !== guestId)) return;
+    if (!targetSocketId || !room.pendingParticipants.has(targetSocketId)) return;
 
-    room.guestId = guestId;
-    room.guestDisplayName = room.pendingDisplayName || 'Guest';
-    room.pendingGuestId = null;
-    room.pendingDisplayName = null;
-    room.status = 'connected';
+    if (room.participants.size >= room.maxParticipants) {
+      io.to(targetSocketId).emit("room-full");
+      return;
+    }
 
-    const members = [
-      { socketId: room.hostId, displayName: room.hostDisplayName, isHost: true },
-      { socketId: room.guestId, displayName: room.guestDisplayName, isHost: false }
-    ];
+    const pendingUser = room.pendingParticipants.get(targetSocketId);
+    room.pendingParticipants.delete(targetSocketId);
 
-    console.log(`🤝 Host ${socket.id} accepted Guest ${guestId} in room ${cleanCode}`);
+    const newMember = {
+      socketId: targetSocketId,
+      displayName: pendingUser.displayName || 'Participant',
+      joinedAt: Date.now(),
+      isHost: false
+    };
 
-    // Notify Guest of acceptance
-    io.to(guestId).emit("accepted", {
-      members,
-      maxMembers: 2,
+    room.participants.set(targetSocketId, newMember);
+    room.status = 'active';
+
+    const allMembers = getRoomMembers(room);
+
+    console.log(`🤝 Host ${socket.id} accepted Participant ${targetSocketId} (${newMember.displayName}) in room ${cleanCode}`);
+
+    // Notify Accepted Participant
+    io.to(targetSocketId).emit("accepted", {
+      members: allMembers,
+      maxMembers: room.maxParticipants,
       hostId: room.hostId,
-      hostDisplayName: room.hostDisplayName
+      socketId: targetSocketId
     });
 
-    // Notify Host that user joined
-    socket.emit("user-joined", {
-      socketId: guestId,
-      displayName: room.guestDisplayName,
-      members
+    // Notify all existing room participants about the new joiner
+    room.participants.forEach((m, sid) => {
+      if (sid !== targetSocketId) {
+        io.to(sid).emit("user-joined", {
+          socketId: targetSocketId,
+          displayName: newMember.displayName,
+          members: allMembers
+        });
+      }
     });
   });
 
-  // Host rejects guest
+  // Host rejects pending participant
   socket.on("reject", (roomCode, targetSocketId) => {
     if (!roomCode || typeof roomCode !== 'string') return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
@@ -480,90 +647,107 @@ io.on("connection", (socket) => {
     if (!room || room.hostId !== socket.id) return;
 
     touchRoom(room);
-    const guestId = targetSocketId || room.pendingGuestId;
-    if (guestId) {
-      console.log(`🚫 Host ${socket.id} rejected Guest ${guestId} in room ${cleanCode}`);
-      io.to(guestId).emit("rejected");
-      if (room.pendingGuestId === guestId) {
-        room.pendingGuestId = null;
-        room.pendingDisplayName = null;
-        room.status = 'waiting';
-      }
+
+    if (targetSocketId && room.pendingParticipants.has(targetSocketId)) {
+      room.pendingParticipants.delete(targetSocketId);
+      console.log(`🚫 Host ${socket.id} rejected Participant ${targetSocketId} in room ${cleanCode}`);
+      io.to(targetSocketId).emit("rejected");
     }
+  });
+
+  // Host kicks participant
+  socket.on("kick-participant", (roomCode, targetSocketId) => {
+    if (!roomCode || typeof roomCode !== 'string') return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    if (!isValidRoomCode(cleanCode)) return;
+
+    const room = rooms[cleanCode];
+    if (!room || room.hostId !== socket.id) return;
+
+    if (targetSocketId && room.participants.has(targetSocketId) && targetSocketId !== room.hostId) {
+      room.participants.delete(targetSocketId);
+      console.log(`🥾 Host ${socket.id} kicked participant ${targetSocketId} from room ${cleanCode}`);
+
+      io.to(targetSocketId).emit("kicked");
+
+      const allMembers = getRoomMembers(room);
+      room.participants.forEach((m, sid) => {
+        io.to(sid).emit("user-left", { socketId: targetSocketId, members: allMembers });
+      });
+    }
+  });
+
+  // Host changes max participants
+  socket.on("change-max-participants", (roomCode, newMaxInput) => {
+    if (!roomCode || typeof roomCode !== 'string') return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    if (!isValidRoomCode(cleanCode)) return;
+
+    const room = rooms[cleanCode];
+    if (!room || room.hostId !== socket.id) return;
+
+    let newMax = parseInt(newMaxInput, 10);
+    if (isNaN(newMax) || newMax < 2) newMax = 2;
+    if (newMax > 50) newMax = 50;
+
+    room.maxParticipants = newMax;
+    touchRoom(room);
+
+    console.log(`⚙️ Host ${socket.id} updated room ${cleanCode} capacity to ${newMax}`);
+
+    const allMembers = getRoomMembers(room);
+    room.participants.forEach((m, sid) => {
+      io.to(sid).emit("room-settings-updated", { maxMembers: newMax, members: allMembers });
+    });
   });
 
   // Targeted & Validated WebRTC Signaling
   socket.on("offer", (roomCode, offer, targetSocketId) => {
-    if (!roomCode || typeof roomCode !== 'string' || !offer || typeof offer !== 'object') return;
+    if (!roomCode || !offer || !targetSocketId || !checkSignalingRateLimit(socket.id)) return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
-    if (!isValidRoomCode(cleanCode)) return;
-    if (!checkSignalingRateLimit(socket.id)) return;
-
     const room = rooms[cleanCode];
-    if (!room) return;
-
-    // Strict validation: must be room's host or guest, and target must be the counter-peer
-    const targetId = targetSocketId || (socket.id === room.hostId ? room.guestId : room.hostId);
-    if (!targetId || !isAuthorizedPeerPair(room, socket.id, targetId)) {
-      return;
-    }
+    if (!room || !isRoomMember(room, socket.id) || !isRoomMember(room, targetSocketId)) return;
 
     touchRoom(room);
-    const senderName = socket.id === room.hostId ? room.hostDisplayName : room.guestDisplayName;
-    io.to(targetId).emit("offer", { offer, senderId: socket.id, senderName });
+    const sender = room.participants.get(socket.id);
+    io.to(targetSocketId).emit("offer", { offer, senderId: socket.id, senderName: sender.displayName });
   });
 
   socket.on("answer", (roomCode, answer, targetSocketId) => {
-    if (!roomCode || typeof roomCode !== 'string' || !answer || typeof answer !== 'object') return;
+    if (!roomCode || !answer || !targetSocketId || !checkSignalingRateLimit(socket.id)) return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
-    if (!isValidRoomCode(cleanCode)) return;
-    if (!checkSignalingRateLimit(socket.id)) return;
-
     const room = rooms[cleanCode];
-    if (!room) return;
-
-    const targetId = targetSocketId || (socket.id === room.hostId ? room.guestId : room.hostId);
-    if (!targetId || !isAuthorizedPeerPair(room, socket.id, targetId)) {
-      return;
-    }
+    if (!room || !isRoomMember(room, socket.id) || !isRoomMember(room, targetSocketId)) return;
 
     touchRoom(room);
-    io.to(targetId).emit("answer", { answer, senderId: socket.id });
+    io.to(targetSocketId).emit("answer", { answer, senderId: socket.id });
   });
 
   socket.on("ice-candidate", (roomCode, candidate, targetSocketId) => {
-    if (!roomCode || typeof roomCode !== 'string' || !candidate) return;
+    if (!roomCode || !candidate || !targetSocketId || !checkSignalingRateLimit(socket.id)) return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
-    if (!isValidRoomCode(cleanCode)) return;
-    if (!checkSignalingRateLimit(socket.id)) return;
-
     const room = rooms[cleanCode];
-    if (!room) return;
-
-    const targetId = targetSocketId || (socket.id === room.hostId ? room.guestId : room.hostId);
-    if (!targetId || !isAuthorizedPeerPair(room, socket.id, targetId)) {
-      return;
-    }
+    if (!room || !isRoomMember(room, socket.id) || !isRoomMember(room, targetSocketId)) return;
 
     touchRoom(room);
-    io.to(targetId).emit("ice-candidate", { candidate, senderId: socket.id });
+    io.to(targetSocketId).emit("ice-candidate", { candidate, senderId: socket.id });
   });
 
   // Media state signaling (mic, cam, screen share)
-  socket.on("peer-state-change", (roomCode, state) => {
-    if (!roomCode || typeof roomCode !== 'string' || !state || typeof state !== 'object') return;
+  socket.on("peer-state-change", (roomCode, state, targetSocketId) => {
+    if (!roomCode || typeof roomCode !== 'string' || !state) return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
-    if (!isValidRoomCode(cleanCode)) return;
-
     const room = rooms[cleanCode];
-    if (!room) return;
+    if (!room || !isRoomMember(room, socket.id)) return;
 
-    const targetId = socket.id === room.hostId ? room.guestId : room.hostId;
-    if (targetId) {
-      touchRoom(room);
-      io.to(targetId).emit("peer-state-change", {
-        socketId: socket.id,
-        ...state
+    touchRoom(room);
+    if (targetSocketId && isRoomMember(room, targetSocketId)) {
+      io.to(targetSocketId).emit("peer-state-change", { socketId: socket.id, ...state });
+    } else {
+      room.participants.forEach((m, sid) => {
+        if (sid !== socket.id) {
+          io.to(sid).emit("peer-state-change", { socketId: socket.id, ...state });
+        }
       });
     }
   });
@@ -571,15 +755,139 @@ io.on("connection", (socket) => {
   socket.on("screen-share-state", (roomCode, isSharing) => {
     if (!roomCode || typeof roomCode !== 'string') return;
     const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
-    if (!isValidRoomCode(cleanCode)) return;
-
     const room = rooms[cleanCode];
-    if (!room) return;
+    if (!room || !isRoomMember(room, socket.id)) return;
 
-    const targetId = socket.id === room.hostId ? room.guestId : room.hostId;
-    if (targetId) {
-      touchRoom(room);
-      io.to(targetId).emit("screen-share-state", !!isSharing);
+    touchRoom(room);
+    room.participants.forEach((m, sid) => {
+      if (sid !== socket.id) {
+        io.to(sid).emit("screen-share-state", { socketId: socket.id, isSharing: !!isSharing });
+      }
+    });
+  });
+
+  // Host toggles room lock state
+  socket.on("room-lock-state", (roomCode, isLocked) => {
+    if (!roomCode || typeof roomCode !== 'string') return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    const room = rooms[cleanCode];
+    if (!room || room.hostId !== socket.id) return;
+
+    room.isLocked = !!isLocked;
+    touchRoom(room);
+
+    console.log(`🔒 Host ${socket.id} set room ${cleanCode} lock state: ${room.isLocked}`);
+
+    const allMembers = getRoomMembers(room);
+    room.participants.forEach((m, sid) => {
+      io.to(sid).emit("room-lock-state", { isLocked: room.isLocked, members: allMembers });
+    });
+  });
+
+  // Participant raises / lowers hand
+  socket.on("raise-hand-state", (roomCode, isRaised) => {
+    if (!roomCode || typeof roomCode !== 'string') return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    const room = rooms[cleanCode];
+    if (!room || !isRoomMember(room, socket.id)) return;
+
+    touchRoom(room);
+    room.participants.forEach((m, sid) => {
+      if (sid !== socket.id) {
+        io.to(sid).emit("raise-hand-state", { socketId: socket.id, isRaised: !!isRaised });
+      }
+    });
+  });
+
+  // Participant sends reaction emoji
+  socket.on("reaction", (roomCode, emoji) => {
+    if (!roomCode || typeof roomCode !== 'string' || !emoji) return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    const room = rooms[cleanCode];
+    if (!room || !isRoomMember(room, socket.id)) return;
+
+    const cleanEmoji = sanitizeString(String(emoji), 8);
+    touchRoom(room);
+    room.participants.forEach((m, sid) => {
+      if (sid !== socket.id) {
+        io.to(sid).emit("reaction", { socketId: socket.id, emoji: cleanEmoji });
+      }
+    });
+  });
+
+  // Media stream URL sharing (MP4, WebM, HLS)
+  socket.on("stream-share-start", (roomCode, payload) => {
+    if (!roomCode || typeof roomCode !== 'string' || !payload) return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    const room = rooms[cleanCode];
+    if (!room || !isRoomMember(room, socket.id)) return;
+
+    touchRoom(room);
+    room.participants.forEach((m, sid) => {
+      if (sid !== socket.id) {
+        io.to(sid).emit("stream-share-start", { senderId: socket.id, ...payload });
+      }
+    });
+  });
+
+  socket.on("stream-share-stop", (roomCode) => {
+    if (!roomCode || typeof roomCode !== 'string') return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    const room = rooms[cleanCode];
+    if (!room || !isRoomMember(room, socket.id)) return;
+
+    touchRoom(room);
+    room.participants.forEach((m, sid) => {
+      if (sid !== socket.id) {
+        io.to(sid).emit("stream-share-stop", { senderId: socket.id });
+      }
+    });
+  });
+
+  socket.on("stream-share-action", (roomCode, actionData) => {
+    if (!roomCode || typeof roomCode !== 'string' || !actionData) return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    const room = rooms[cleanCode];
+    if (!room || !isRoomMember(room, socket.id)) return;
+
+    touchRoom(room);
+    room.participants.forEach((m, sid) => {
+      if (sid !== socket.id) {
+        io.to(sid).emit("stream-share-action", { senderId: socket.id, ...actionData });
+      }
+    });
+  });
+
+  // Host mutes all participants
+  socket.on("mute-all", (roomCode) => {
+    if (!roomCode || typeof roomCode !== 'string') return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    const room = rooms[cleanCode];
+    if (!room || room.hostId !== socket.id) return;
+
+    touchRoom(room);
+    room.participants.forEach((m, sid) => {
+      if (sid !== socket.id) {
+        io.to(sid).emit("muted-by-host");
+      }
+    });
+  });
+
+  socket.on("chat-message", (roomCode, payload, targetSocketId) => {
+    if (!roomCode || !payload) return;
+    const cleanCode = sanitizeString(roomCode, 6).toUpperCase();
+    const room = rooms[cleanCode];
+    if (!room || !isRoomMember(room, socket.id)) return;
+
+    touchRoom(room);
+    if (targetSocketId && isRoomMember(room, targetSocketId)) {
+      io.to(targetSocketId).emit("chat-message", { senderId: socket.id, ...payload });
+    } else {
+      room.participants.forEach((m, sid) => {
+        if (sid !== socket.id) {
+          io.to(sid).emit("chat-message", { senderId: socket.id, ...payload });
+        }
+      });
     }
   });
 
@@ -591,31 +899,47 @@ io.on("connection", (socket) => {
     for (const code in rooms) {
       const room = rooms[code];
 
-      // Case 1: Pending guest canceled / disconnected
-      if (room.pendingGuestId === socket.id) {
-        room.pendingGuestId = null;
-        room.pendingDisplayName = null;
-        room.status = room.guestId ? 'connected' : 'waiting';
+      // Case 1: Pending participant canceled / disconnected
+      if (room.pendingParticipants.has(socket.id)) {
+        room.pendingParticipants.delete(socket.id);
         io.to(room.hostId).emit("guest-canceled", { socketId: socket.id });
       }
 
-      // Case 2: Host disconnected
-      if (room.hostId === socket.id) {
-        console.log(`🧹 Host disconnected from room ${code}`);
-        if (room.guestId) {
-          io.to(room.guestId).emit("peer-disconnected", { socketId: socket.id, role: 'host' });
-          io.to(room.guestId).emit("user-left", { socketId: socket.id });
+      // Case 2: Accepted participant disconnected
+      if (room.participants.has(socket.id)) {
+        const leavingMember = room.participants.get(socket.id);
+        room.participants.delete(socket.id);
+        console.log(`🧹 Participant ${socket.id} (${leavingMember.displayName}) left room ${code}`);
+
+        // If Host disconnected
+        if (room.hostId === socket.id) {
+          if (room.participants.size > 0) {
+            // Transfer host role to oldest remaining participant
+            const nextHost = Array.from(room.participants.values())[0];
+            nextHost.isHost = true;
+            room.hostId = nextHost.socketId;
+            console.log(`👑 Transferred host role to ${nextHost.socketId} (${nextHost.displayName}) in room ${code}`);
+
+            const remainingMembers = getRoomMembers(room);
+            room.participants.forEach((m, sid) => {
+              io.to(sid).emit("host-changed", {
+                newHostId: nextHost.socketId,
+                newHostName: nextHost.displayName,
+                members: remainingMembers
+              });
+              io.to(sid).emit("user-left", { socketId: socket.id, members: remainingMembers });
+            });
+          } else {
+            console.log(`🧹 Deleting empty room ${code}`);
+            delete rooms[code];
+          }
+        } else {
+          // Non-host left
+          const remainingMembers = getRoomMembers(room);
+          room.participants.forEach((m, sid) => {
+            io.to(sid).emit("user-left", { socketId: socket.id, members: remainingMembers });
+          });
         }
-        delete rooms[code];
-      }
-      // Case 3: Guest disconnected
-      else if (room.guestId === socket.id) {
-        console.log(`🧹 Guest disconnected from room ${code}`);
-        room.guestId = null;
-        room.guestDisplayName = null;
-        room.status = 'waiting';
-        io.to(room.hostId).emit("peer-disconnected", { socketId: socket.id, role: 'guest' });
-        io.to(room.hostId).emit("user-left", { socketId: socket.id });
       }
     }
   });
@@ -639,21 +963,12 @@ setInterval(() => {
   }
 }, 15 * 60 * 1000);
 
-// Handle server errors
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`⚠️ Port ${process.env.PORT || 3000} is already in use.`);
-  } else {
-    console.error('Server error:', err.message);
-  }
-});
-
 // Start server with automatic fallback if default port is in use
 let PORT = process.env.PORT || 3000;
 
 function listen(port) {
   server.listen(port, () => {
-    console.log(`✅ Nexus 1-to-1 WebRTC Signaling server running on http://localhost:${port}`);
+    console.log(`✅ Nexus Multi-Participant WebRTC Server running on http://localhost:${port}`);
   });
 }
 
@@ -670,4 +985,5 @@ server.on('error', (err) => {
 });
 
 listen(PORT);
+
 

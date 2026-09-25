@@ -34,25 +34,43 @@
     <!-- Main Video Stage -->
     <main class="room-stage" id="roomStage">
       <div class="video-container" id="videoContainer">
+        <!-- Stream Share Player Overlay -->
+        <div id="streamPlayerWrap" class="stream-player-wrap" style="display: none;">
+          <div class="stream-player-header">
+            <span id="streamTitleText">🎬 Shared Media Stream</span>
+            <button class="ghost-btn" style="padding: 2px 8px; font-size: 11px;" onclick="closeStreamShare()">Close Stream ✕</button>
+          </div>
+          <video id="streamVideo" controls playsinline crossorigin="anonymous"></video>
+        </div>
+
         <!-- Screen Share Banner -->
         <div id="screenShareBanner" class="screen-share-banner" style="display: none;">
           🖥️ <span id="screenShareText">Screen Share Active</span>
         </div>
 
-        <!-- Remote Main Video -->
-        <div class="remote-video-wrap video-primary" id="remoteVideoWrap" role="region" aria-label="Remote video stream">
-          <video id="remoteVideo" autoplay playsinline></video>
-          <div id="remoteAvatar" class="avatar-placeholder">
+        <!-- Drag-to-Hide Trash Target -->
+        <div id="dropTrashTarget" class="drop-trash-target" style="display: none;">
+          <span class="trash-icon">🗑</span>
+          <span class="trash-text">Drop to hide preview</span>
+        </div>
+
+        <!-- Dynamic Multi-Participant Video Grid -->
+        <div class="remote-video-grid" id="remoteVideoGrid" data-count="0" data-layout="grid">
+          <div id="waitingTile" class="avatar-placeholder waiting-placeholder">
             <div class="avatar-icon">P</div>
-            <span>Waiting for peer...</span>
+            <span id="waitingText">Waiting for participants to join...</span>
           </div>
         </div>
 
         <!-- Floating Local PiP Video -->
-        <div class="local-video-wrap mirror video-mini draggable-preview" id="localVideoWrap" role="button" tabindex="0" aria-label="Tap to swap camera view, drag to move preview">
+        <div class="local-video-wrap mirror video-mini draggable-preview" id="localVideoWrap" role="button" tabindex="0" aria-label="Local video preview (Drag to move, drop to hide)">
           <video id="localVideo" autoplay playsinline muted></video>
           <div id="localAvatar" class="avatar-placeholder">
             <div class="avatar-icon">YOU</div>
+          </div>
+          <div id="localQualityBadge" class="local-quality-badge">🟢 1080p • 30 FPS</div>
+          <div class="mini-overlay-controls">
+            <button class="mini-control-btn btn-hide-mini" onclick="hideLocalPreviewTile(event)" title="Hide video preview" aria-label="Hide video preview">✕</button>
           </div>
         </div>
       </div>
@@ -60,6 +78,10 @@
 
     <!-- Bottom Control Toolbar -->
     <div class="controls-bar" role="toolbar" aria-label="Call controls">
+      <button id="btnRestoreMini" class="ctrl-btn" data-tooltip="Show Local Preview" aria-label="Restore Video Preview" onclick="restoreLocalPreviewTile(event)" style="display: none;">
+        <svg viewBox="0 0 24 24"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
+      </button>
+
       <button id="btnAudio" class="ctrl-btn" data-tooltip="Toggle Mic (M)" aria-label="Toggle Microphone" onclick="toggleAudio()">
         <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5-3c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
       </button>
@@ -80,6 +102,35 @@
 
       <button id="btnVideo" class="ctrl-btn" data-tooltip="Toggle Camera (V)" aria-label="Toggle Camera" onclick="toggleVideo()">
         <svg viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg>
+      </button>
+
+      <button id="btnSwitchCam" class="ctrl-btn" data-tooltip="Switch Camera" aria-label="Switch Camera (Front/Back)" onclick="switchCameraFacingMode()">
+        <svg viewBox="0 0 24 24"><path d="M9.37 5.51A7 7 0 0 0 4 12c0 3.87 3.13 7 7 7 3.47 0 6.36-2.52 6.92-5.88h-2.04A4.996 4.996 0 0 1 11 17c-2.76 0-5-2.24-5-5 0-2.05 1.23-3.81 3-4.58V10l4-3.5L9 3v2.51zm9.26 3.97A7.003 7.003 0 0 0 13 3c-3.47 0-6.36 2.52-6.92 5.88h2.04A4.996 4.996 0 0 1 13 5c2.76 0 5 2.24 5 5 0 2.05-1.23 3.81-3 4.58V12l-4 3.5 4 3.5v-2.51z"/></svg>
+      </button>
+
+      <button id="btnLayout" class="ctrl-btn" data-tooltip="Layout Mode (Grid/Active/Pinned)" aria-label="Layout Mode" onclick="toggleLayoutMode()">
+        <span id="layoutBtnIcon" style="font-size: 16px;">▦</span>
+      </button>
+
+      <button id="btnRaiseHand" class="ctrl-btn" data-tooltip="Raise Hand 🙋" aria-label="Raise Hand" onclick="toggleRaiseHand()">
+        <span style="font-size: 16px;">🙋</span>
+      </button>
+
+      <div class="reactions-control-wrap" style="position: relative;">
+        <button id="btnReactions" class="ctrl-btn" data-tooltip="Reactions" aria-label="Reactions" onclick="toggleReactionsPopup()">
+          <span style="font-size: 16px;">😄</span>
+        </button>
+        <div id="reactionsPopup" class="reactions-popup" style="display: none;">
+          <button class="rxn-btn" onclick="sendReaction('👍')">👍</button>
+          <button class="rxn-btn" onclick="sendReaction('❤️')">❤️</button>
+          <button class="rxn-btn" onclick="sendReaction('😂')">😂</button>
+          <button class="rxn-btn" onclick="sendReaction('👏')">👏</button>
+          <button class="rxn-btn" onclick="sendReaction('🔥')">🔥</button>
+        </div>
+      </div>
+
+      <button id="btnStream" class="ctrl-btn" data-tooltip="Share Stream (MP4/WebM/HLS)" aria-label="Stream Share" onclick="openStreamModal()">
+        <span style="font-size: 16px;">🎬</span>
       </button>
 
       <button id="btnScreen" class="ctrl-btn" data-tooltip="Share Screen" aria-label="Share Screen" onclick="toggleScreenShare()">
@@ -143,8 +194,8 @@
   <!-- Host Approval Modal Popup -->
   <div id="approvalPopup" class="modal" role="dialog" aria-modal="true">
     <div class="modal-content">
-      <h2>Incoming Guest</h2>
-      <p style="color: var(--muted); font-size: 13.5px;">A participant wants to join your Nexus room.</p>
+      <h2>Incoming Participant <span id="pendingCountBadge" style="font-size: 11px; background: var(--surface-solid); border: 1px solid var(--border); padding: 2px 8px; border-radius: 12px; font-weight: normal; vertical-align: middle; display: none;"></span></h2>
+      <p style="color: var(--muted); font-size: 13.5px;">A participant wants to join your room call.</p>
       <div class="modal-buttons">
         <button id="rejectBtn" class="ghost-btn" style="color: var(--danger); border-color: var(--danger);">Reject</button>
         <button id="acceptBtn" class="btn-primary">Accept & Connect</button>
@@ -224,6 +275,28 @@
           <input type="checkbox" id="chkPtt" onchange="togglePushToTalk(this.checked)" />
         </div>
 
+        <div class="form-group" id="groupMaxMembersSetting">
+          <label for="settingsMaxMembers">Maximum Participants</label>
+          <select id="settingsMaxMembers" onchange="changeRoomCapacity(this.value)">
+            <option value="2">2 Participants (1-on-1)</option>
+            <option value="4">4 Participants</option>
+            <option value="6">6 Participants</option>
+            <option value="8">8 Participants</option>
+            <option value="10">10 Participants</option>
+            <option value="16">16 Participants</option>
+            <option value="32">32 Participants</option>
+          </select>
+        </div>
+
+        <div class="form-group" id="groupHostControls" style="display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); padding-top: 10px;">
+          <label style="font-weight: 600; color: var(--accent);">👑 Host Controls</label>
+          <div style="display: flex; align-items: center; justify-content: space-between;">
+            <label for="chkLockRoom" style="cursor: pointer;">Lock Room (Prevent new joins)</label>
+            <input type="checkbox" id="chkLockRoom" onchange="toggleLockRoom(this.checked)" />
+          </div>
+          <button class="ghost-btn" style="color: var(--warning); border-color: var(--warning); justify-content: center; width: 100%;" onclick="muteAllParticipants()">🔇 Mute All Participants</button>
+        </div>
+
         <div class="form-group">
           <label>Room Summary</label>
           <div style="background: var(--bg-secondary); border: 1px solid var(--border); padding: 10px; border-radius: 8px; font-size: 12px; display: flex; flex-direction: column; gap: 4px;">
@@ -263,10 +336,10 @@
           <label for="videoQualitySelect">Video Resolution Quality</label>
           <select id="videoQualitySelect" onchange="changeVideoQuality(this.value)">
             <option value="auto" selected>Auto (Adaptive)</option>
-            <option value="1080">1080p (Full HD)</option>
-            <option value="720">720p (HD)</option>
-            <option value="480">480p (SD)</option>
-            <option value="360">360p (Low Bandwidth)</option>
+            <option value="1080">1080p (Full HD • ~3.5 Mbps)</option>
+            <option value="720">720p (HD • ~1.8 Mbps)</option>
+            <option value="540">540p (Standard • ~1.0 Mbps)</option>
+            <option value="360">360p (Low Bandwidth • ~0.5 Mbps)</option>
           </select>
         </div>
       </div>
@@ -364,8 +437,31 @@
     </div>
   </div>
 
+  <!-- Stream Share Media Modal -->
+  <div id="streamModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="streamTitle">
+    <div class="modal-content">
+      <h2 id="streamTitle">🎬 Share Media Stream</h2>
+      <p style="color: var(--muted); font-size: 13.5px;">Paste a browser-playable media URL to watch together with call participants in real-time.</p>
+
+      <div class="form-group">
+        <label for="streamUrlInput">Media Stream URL (Direct, Signed, or Extensionless)</label>
+        <input id="streamUrlInput" type="url" placeholder="https://example.com/video-stream or https://cdn.com/file.mp4?signature=..." aria-label="Media Stream URL">
+      </div>
+
+      <div style="font-size: 11.5px; color: var(--muted); background: var(--surface-solid); border: 1px solid var(--border); padding: 8px 12px; border-radius: 8px;">
+        💡 Supports Signed/Extensionless URLs, MP4, WebM, HLS (.m3u8), MKV, and HTTP Range streaming. Opaque URL handling with zero RAM storage.
+      </div>
+
+      <div class="modal-buttons" style="margin-top: 12px;">
+        <button class="ghost-btn" onclick="closeStreamModal()">Cancel</button>
+        <button class="btn-primary" onclick="submitStreamShare()">Share Stream</button>
+      </div>
+    </div>
+  </div>
+
   <!-- External & System Scripts -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.4.12/hls.min.js"></script>
   <script src="/silk.js"></script>
   <script src="/qrcode.min.js"></script>
   <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
